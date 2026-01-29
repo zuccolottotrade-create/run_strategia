@@ -1,32 +1,96 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+"""
+run_strategia.py - Apply a strategy (Excel) to a KPI CSV and generate SIGNAL/HOLD/VALUE.
+
+Key goals:
+- Single, deterministic KPI loader with robust EU numeric parsing (comma decimals)
+- Single normalization path for supertrend_dir / supertrend_dir_txt
+- Keep pipeline env overrides + optional strategy QC
+- Keep engine integration (load_engine.load_config_strategy / generate_signals)
+- IMPORTANT: QC/preflight single source of truth (same behavior as stand-alone preflight)
+"""
+
+# ============================================================
+# BOOTSTRAP – must stay BEFORE importing suite modules
+# ============================================================
+import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Any, Set
+
+SUITE_ROOT = Path(__file__).resolve().parents[1]  # .../Py_SUITE_TRADING
+if str(SUITE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUITE_ROOT))
+
+# ============================================================
+# IMPORT STANDARD
+# ============================================================
 import math
+import os
+import shutil
+from dataclasses import dataclass
+from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
 # ============================================================
-# CONFIG (modifica se necessario)
+# IMPORT SUITE
 # ============================================================
-TEST_DATA_DIR = Path("/Users/claudio 1/n8n-shared/Test Data")
-STRATEGY_DIR = Path("/Users/claudio 1/n8n-shared/config_strategy")
+from shared.paths import DATA_DIR
+
+# ============================================================
+# STRATEGY QC (single source of truth: use strategy_qc.py)
+# ============================================================
+try:
+    from strategy_qc import qc_strategy_preflight, _print_qc_summary  # type: ignore
+except Exception as _qc_err:  # pragma: no cover
+    qc_strategy_preflight = None
+    _print_qc_summary = None
+    _QC_IMPORT_ERR = _qc_err
+else:
+    _QC_IMPORT_ERR = None
+
+# ============================================================
+# ENV HELPERS (defaults decided by pipeline)
+# ============================================================
+def _env_path(name: str) -> Optional[Path]:
+    v = os.environ.get(name, "").strip()
+    return Path(v) if v else None
+
+
+PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "").strip() == "1"
+PREFLIGHT_ONESHOT = os.environ.get("PREFLIGHT_ONESHOT", "").strip() == "1"
+
+
+
+
+ENV_DATA_DIR = _env_path("PY_SUITE_DATA_DIR")
+ENV_OUT_DIR = _env_path("PY_SUITE_OUT_DIR")
+
+ENV_STRATEGY_FILE = _env_path("PY_SUITE_STRATEGY_FILE")
+ENV_STRATEGY_DIR = _env_path("PY_SUITE_STRATEGY_DIR")
+ENV_KPI_FILE = _env_path("PY_SUITE_KPI_INPUT_CSV")
+
+# ============================================================
+# CONFIG
+# ============================================================
+PY_SUITE_ROOT = Path(os.environ.get("PY_SUITE_ROOT", str(SUITE_ROOT))).resolve()
+
+TEST_DATA_DIR = DATA_DIR
+DEFAULT_STRATEGY_DIR = PY_SUITE_ROOT / "_data" / "config_strategia"
+STRATEGY_DIR = (ENV_STRATEGY_DIR if ENV_STRATEGY_DIR else DEFAULT_STRATEGY_DIR).resolve()
+STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
+
 CSV_SEP = ";"
 
 ALLOWED_SIGNALS = {"LONG", "SHORT", "NEUTRAL"}
 HOLD_IN = "IN"
-HOLD_SHORT = "SHORT"
 HOLD_OUT = "OUT"
-
 
 # ============================================================
 # IMPORT ENGINE
 # ============================================================
 try:
-    # load_engine.py è nello stesso livello di run_strategia.py
     from load_engine import load_config_strategy, generate_signals, Condition  # type: ignore
 except Exception as e:  # pragma: no cover
     load_config_strategy = None
@@ -38,32 +102,186 @@ else:
 
 
 # ============================================================
-# ADAPTER: interfaccia richiesta
+# SMALL UTILS
+# ============================================================
+def graceful_exit(msg: str, code: int = 0) -> None:
+    print(msg)
+    raise SystemExit(code)
+
+
+def ensure_engine_available() -> None:
+    if _IMPORT_ERR is not None or load_config_strategy is None or generate_signals is None:
+        print("ERRORE: impossibile importare load_engine.")
+        print(f"Dettaglio: {_IMPORT_ERR!r}")
+        raise SystemExit(2)
+
+
+def list_files(directory: Path, exts: Optional[Sequence[str]] = None) -> List[Path]:
+    if not directory.exists():
+        graceful_exit(f"Directory inesistente: {directory}", 2)
+
+    files = [p for p in directory.iterdir() if p.is_file()]
+    files = [p for p in files if not p.name.startswith(("~$", "."))]
+    files = [p for p in files if not p.name.lower().endswith(".bak")]
+
+    if exts:
+        extset = {e.lower().lstrip(".") for e in exts}
+        files = [p for p in files if p.suffix.lower().lstrip(".") in extset]
+
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def list_kpi_files_only(directory: Path) -> List[Path]:
+    return [p for p in list_files(directory, ["csv"]) if p.name.startswith("KPI_")]
+
+
+def select_from_menu(prompt: str, options: Sequence[Path]) -> Path:
+    if not options:
+        graceful_exit("Nessun file disponibile.", 2)
+
+    while True:
+        print("\n" + prompt)
+        for i, p in enumerate(options, 1):
+            print(f"  {i}. {p.name}")
+
+        c = input("Seleziona numero: ").strip()
+        if c.isdigit():
+            idx = int(c)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+
+        print("Scelta non valida.")
+
+
+# ============================================================
+# NORMALIZATION HELPERS
+# ============================================================
+def _norm_str_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"NAN": pd.NA, "NONE": pd.NA, "": pd.NA})
+    )
+
+
+def normalize_signal_hold(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "SIGNAL" in out.columns:
+        out["SIGNAL"] = _norm_str_series(out["SIGNAL"])
+    if "HOLD" in out.columns:
+        out["HOLD"] = _norm_str_series(out["HOLD"])
+    return out
+
+
+def coerce_numeric_eu_inplace(df: pd.DataFrame, cols: List[str]) -> None:
+    """
+    Convert EU formatted numeric strings to floats.
+    Handles both:
+      - 28,385 -> 28.385
+      - 1.234,56 -> 1234.56
+    """
+    for c in cols:
+        if c not in df.columns:
+            continue
+
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            continue
+
+        s2 = (
+            s.astype(str)
+            .str.strip()
+            .replace({"": None, "nan": None, "None": None, "NAN": None, "NONE": None})
+        )
+        # thousands "." and decimal ","
+        s2 = s2.str.replace(".", "", regex=False)
+        s2 = s2.str.replace(",", ".", regex=False)
+
+        df[c] = pd.to_numeric(s2, errors="coerce")
+
+
+def normalize_supertrend_direction(df: pd.DataFrame) -> None:
+    """
+    Normalizes/creates:
+      - supertrend_dir      as Int64 (+1 / -1)
+      - supertrend_dir_txt  as "UP"/"DOWN"
+
+    Priority:
+      1) If supertrend_dir exists and is numeric-like, use it
+      2) Else, if supertrend_dir_txt exists, map it
+      3) Else, if close & supertrend exist, derive direction from close > supertrend
+    """
+    if "supertrend_dir_txt" in df.columns:
+        df["supertrend_dir_txt"] = _norm_str_series(df["supertrend_dir_txt"])
+
+    if "supertrend_dir" not in df.columns:
+        df["supertrend_dir"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+
+    sdir_raw = _norm_str_series(df["supertrend_dir"])
+    sdir_num = pd.to_numeric(sdir_raw.str.replace(",", ".", regex=False), errors="coerce")
+    if sdir_num.notna().mean() >= 0.5:
+        df["supertrend_dir"] = sdir_num.astype("Int64")
+    else:
+        if "supertrend_dir_txt" in df.columns:
+            m_txt = {"UP": 1, "DOWN": -1, "LONG": 1, "SHORT": -1}
+            mapped = df["supertrend_dir_txt"].map(m_txt)
+            if mapped.notna().mean() >= 0.5:
+                df["supertrend_dir"] = mapped.astype("Int64")
+
+    if df["supertrend_dir"].isna().any() and {"close", "supertrend"}.issubset(df.columns):
+        mask = df["supertrend_dir"].isna() & df["close"].notna() & df["supertrend"].notna()
+        df.loc[mask, "supertrend_dir"] = (df.loc[mask, "close"] > df.loc[mask, "supertrend"]).map(
+            {True: 1, False: -1}
+        ).astype("Int64")
+
+    df["supertrend_dir_txt"] = df["supertrend_dir"].map({1: "UP", -1: "DOWN"}).astype("object")
+
+
+# ============================================================
+# GROUPING
+# ============================================================
+def iter_groups(df: pd.DataFrame):
+    has_symbol = "symbol" in df.columns
+    has_isin = "isin" in df.columns
+
+    if not has_symbol:
+        yield ("__ALL__", "__ALL__"), df
+        return
+
+    sym = df["symbol"].astype("string").fillna("").str.strip()
+
+    if not has_isin:
+        yield from df.groupby(sym, sort=False)
+        return
+
+    isin = df["isin"].astype("string").fillna("").str.strip()
+
+    if (isin == "").mean() > 0.95:
+        for k, g in df.groupby(sym, sort=False):
+            yield (k, ""), g
+        return
+
+    tmp = df.copy()
+    tmp["__symbol_key__"] = sym
+    tmp["__isin_key__"] = isin
+
+    for (k1, k2), g in tmp.groupby(["__symbol_key__", "__isin_key__"], sort=False, dropna=False):
+        g = g.drop(columns=["__symbol_key__", "__isin_key__"])
+        yield (k1, k2), g
+
+
+# ============================================================
+# STRATEGY ADAPTER
 # ============================================================
 @dataclass(frozen=True)
 class Strategy:
-    """
-    Adapter per rendere l'engine compatibile con:
-    - strategy.required_indicators
-    - compute_signal(df, strategy)
-    """
     path: Path
     conditions: List[Any]  # List[Condition]
     required_indicators: List[str]
 
 
-def ensure_engine_available() -> None:
-    if _IMPORT_ERR is not None or load_config_strategy is None or generate_signals is None:
-        print("ERRORE: impossibile importare il load-engine.")
-        print("Verifica che 'load_engine.py' sia nello stesso livello e che l'import sia corretto.")
-        print(f"Dettaglio errore import: {_IMPORT_ERR!r}")
-        raise SystemExit(2)
-
-
 def compute_required_indicators_from_conditions(conditions: List[Any]) -> List[str]:
-    """
-    Required indicators = lhs_col (enabled) + rhs_col (enabled and rhs_type=COLUMN).
-    """
     req: Set[str] = set()
     for c in conditions:
         if not getattr(c, "enabled", False):
@@ -73,8 +291,7 @@ def compute_required_indicators_from_conditions(conditions: List[Any]) -> List[s
         if lhs:
             req.add(lhs)
 
-        rhs_type = str(getattr(c, "rhs_type", "")).strip().upper()
-        if rhs_type == "COLUMN":
+        if str(getattr(c, "rhs_type", "")).upper() == "COLUMN":
             rhs_col = str(getattr(c, "rhs_col", "")).strip()
             if rhs_col:
                 req.add(rhs_col)
@@ -89,502 +306,474 @@ def load_strategy(path: str) -> Strategy:
     return Strategy(path=p, conditions=conds, required_indicators=required)
 
 
-def compute_signal(df: pd.DataFrame, strategy: Strategy) -> pd.Series:
-    """
-    Usa generate_signals() e mappa position -> LONG/SHORT/NEUTRAL.
-    """
-    out = generate_signals(df, strategy.conditions, reverse_immediate=True, exit_priority=True)
-
-    if "position" not in out.columns:
-        raise ValueError("generate_signals non ha prodotto la colonna 'position'.")
-
-    pos = pd.to_numeric(out["position"], errors="coerce").fillna(0).astype(int)
-    sig = pos.map({1: "LONG", -1: "SHORT", 0: "NEUTRAL"}).astype(str)
-
-    sig.index = df.index
-    return sig
-
-
 # ============================================================
-# UTILITIES CLI
-# ============================================================
-def graceful_exit(message: str, code: int = 0) -> None:
-    print(message)
-    raise SystemExit(code)
-
-
-def list_files(directory: Path, exts: Optional[Sequence[str]] = None) -> List[Path]:
-    if not directory.exists() or not directory.is_dir():
-        graceful_exit(f"ERRORE: directory non valida o inesistente: {directory}", code=2)
-
-    files = [p for p in directory.iterdir() if p.is_file()]
-    if exts:
-        exts_norm = {e.lower().lstrip(".") for e in exts}
-        files = [p for p in files if p.suffix.lower().lstrip(".") in exts_norm]
-
-    files.sort(key=lambda p: p.name.lower())
-    return files
-
-
-def select_from_menu(prompt: str, options: Sequence[Path]) -> Path:
-    if not options:
-        graceful_exit("ERRORE: nessun file disponibile per la selezione.", code=2)
-
-    while True:
-        print("\n" + prompt)
-        for i, p in enumerate(options, start=1):
-            print(f"  {i}. {p.name}")
-
-        choice = input("Seleziona un numero: ").strip()
-        if not choice.isdigit():
-            print("Input non valido. Inserisci un numero.")
-            continue
-
-        idx = int(choice)
-        if not (1 <= idx <= len(options)):
-            print("Scelta fuori range.")
-            continue
-
-        return options[idx - 1]
-
-
-# ============================================================
-# LOADING KPI
+# KPI LOADING (CLEAN, DETERMINISTIC)
 # ============================================================
 def load_kpi_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
-        graceful_exit(f"ERRORE: file KPI non trovato: {path}", code=2)
+        graceful_exit(f"File KPI non trovato: {path}", 2)
 
     df = pd.read_csv(path, sep=CSV_SEP, dtype=str)
     df.columns = [c.strip() for c in df.columns]
 
-    required_base = {"date", "time", "close"}
-    missing_base = [c for c in required_base if c not in df.columns]
-    if missing_base:
-        graceful_exit(
-            f"ERRORE: il file KPI non contiene le colonne minime richieste: {missing_base}",
-            code=2,
-        )
+    for col in ("date", "time", "close"):
+        if col not in df.columns:
+            graceful_exit(f"Colonna mancante: {col}", 2)
 
-    # close numerico (supporta virgola decimale)
-    df["close"] = df["close"].astype(str).str.replace(",", ".", regex=False).str.strip()
+    non_numeric = {
+        "symbol",
+        "isin",
+        "date",
+        "time",
+        "datetime",
+        "exchange",
+        "currency",
+        "supertrend_dir_txt",
+        "SIGNAL",
+        "HOLD",
+        "VALUE",
+    }
+    numeric_candidates = [c for c in df.columns if c not in non_numeric]
+    coerce_numeric_eu_inplace(df, numeric_candidates)
+
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    if df["close"].isna().any():
-        bad = int(df["close"].isna().sum())
-        graceful_exit(
-            f"ERRORE: colonna 'close' non numerica per {bad} righe. Correggi il CSV KPI.",
-            code=2,
-        )
+    if df["close"].isna().all():
+        graceful_exit("Colonna 'close' non convertibile a numerico (verifica separatore/decimali).", 2)
 
-    # datetime = date + " " + time
+    normalize_supertrend_direction(df)
+
+    dt_raw = df["date"].astype(str).str.strip()
+    sample = dt_raw.dropna().head(20).tolist()
+    looks_iso = any(len(x) >= 10 and x[4:5] == "-" for x in sample)
+
     df["datetime"] = pd.to_datetime(
         df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip(),
         errors="coerce",
+        dayfirst=(not looks_iso),
     )
+
     if df["datetime"].isna().any():
-        bad = int(df["datetime"].isna().sum())
-        graceful_exit(
-            f"ERRORE: impossibile calcolare 'datetime' per {bad} righe (controlla date/time).",
-            code=2,
-        )
+        graceful_exit("Datetime non valide nel CSV KPI.", 2)
 
-    # Ordinamento deterministico (migliore per file multi-strumento)
-    if "symbol" in df.columns and "isin" in df.columns:
-        df = df.sort_values(by=["symbol", "isin", "datetime"], ascending=True).reset_index(drop=True)
-    else:
-        df = df.sort_values(by=["datetime"], ascending=True).reset_index(drop=True)
-
-    return df
-
-
-def has_group_keys(df: pd.DataFrame) -> bool:
-    return ("symbol" in df.columns) and ("isin" in df.columns)
-
-
-def iter_groups(df: pd.DataFrame) -> Iterable[Tuple[Tuple[str, str], pd.DataFrame]]:
-    if has_group_keys(df):
-        for (sym, isin), g in df.groupby(["symbol", "isin"], sort=False):
-            yield (str(sym), str(isin)), g
-    else:
-        yield ("__ALL__", "__ALL__"), df
+    return df.reset_index(drop=True)
 
 
 # ============================================================
-# VALIDAZIONE INDICATORI
+# COERCE REQUIRED INDICATORS (ENGINE INPUT SANITY)
 # ============================================================
-def validate_required_indicators(df: pd.DataFrame, required_indicators: Sequence[str]) -> List[str]:
-    cols = set(df.columns)
-    return [c for c in required_indicators if c not in cols]
-
-def diagnose_strategy_xlsx(path_xlsx: Path, sheet_name: str = "CONDITIONS") -> List[str]:
-    try:
-        df = pd.read_excel(path_xlsx, sheet_name=sheet_name, dtype=str)
-    except Exception as e:
-        return [f"Impossibile leggere Excel: {e!r}"]
-
-    needed = {"id", "enabled", "rhs_type", "rhs_value", "rhs_col", "operator"}
-    missing = sorted(needed - set(df.columns))
-    if missing:
-        return [f"Excel non conforme: mancano colonne {missing}"]
-
-    def norm(x: Any) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        if s.lower() == "nan":
-            return ""
-        return s.strip()
-
-    def to_bool(x: Any) -> bool:
-        s = norm(x).upper()
-        return s in {"TRUE", "VERO", "1", "YES", "Y"}
-
-    issues: List[str] = []
-
-    for _, row in df.iterrows():
-        cid = norm(row.get("id"))
-        if not cid:
-            continue
-
-        # DEBUG mirato su C001 (temporaneo)
-        if cid == "C001":
-            raw_rhs_col = row.get("rhs_col")
-            print("DEBUG C001 rhs_col RAW repr:", repr(raw_rhs_col))
-
-        enabled = to_bool(row.get("enabled"))
-        if not enabled:
-            continue
-
-        rhs_type = norm(row.get("rhs_type")).upper()
-        rhs_col = norm(row.get("rhs_col"))
-        rhs_value = norm(row.get("rhs_value"))
-        op = norm(row.get("operator"))
-
-        # ... qui sotto restano le tue regole di diagnosi (LIST/COLUMN/VALUE) ...
-
-    return issues
+def _safe_numeric_series(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return s
+    raw = s.astype(str).str.strip()
+    raw = raw.replace({"": None, "nan": None, "None": None, "NAN": None, "NONE": None})
+    raw = raw.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    num = pd.to_numeric(raw, errors="coerce")
+    return num
 
 
-    # Se manca qualche colonna, segnala e basta
-    needed = {"id", "enabled", "rhs_type", "rhs_value", "rhs_col", "operator"}
-    missing = sorted(needed - set(df.columns))
-    if missing:
-        return [f"Excel non conforme: mancano colonne {missing}"]
-
-    def norm(x: Any) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        if s.lower() == "nan":
-            return ""
-        return s.strip()
-
-    def to_bool(x: Any) -> bool:
-        s = norm(x).upper()
-        return s in {"TRUE", "VERO", "1", "YES", "Y"}
-
-    issues: List[str] = []
-
-    for _, row in df.iterrows():
-        cid = norm(row.get("id"))
-        if not cid:
-            continue
-
-        enabled = to_bool(row.get("enabled"))
-        if not enabled:
-            continue
-
-        rhs_type = norm(row.get("rhs_type")).upper()
-        rhs_col = norm(row.get("rhs_col"))
-        rhs_value = norm(row.get("rhs_value"))
-        op = norm(row.get("operator"))
-
-        # Regole coerenti con il tuo engine:
-        if rhs_type == "LIST":
-            if rhs_col != "":
-                issues.append(
-                    f"[{cid}] rhs_type=LIST ma rhs_col='{rhs_col}' (deve essere vuoto)"
-                )
-            if rhs_value == "":
-                issues.append(
-                    f"[{cid}] rhs_type=LIST ma rhs_value è vuoto (richiesto, formato '(a,b,...)')"
-                )
-            elif not (rhs_value.startswith("(") and rhs_value.endswith(")")):
-                issues.append(
-                    f"[{cid}] rhs_type=LIST ma rhs_value='{rhs_value}' non è nel formato '(a,b,...)'"
-                )
-            if op == "between":
-                # tra parentesi devono esserci 2 elementi
-                inner = rhs_value[1:-1].strip() if (rhs_value.startswith("(") and rhs_value.endswith(")")) else ""
-                parts = [p.strip() for p in inner.split(",") if p.strip()] if inner else []
-                if len(parts) != 2:
-                    issues.append(
-                        f"[{cid}] operator=between richiede LIST con 2 elementi (min,max), trovato: {rhs_value}"
-                    )
-
-        elif rhs_type == "COLUMN":
-            if rhs_col == "":
-                issues.append(
-                    f"[{cid}] rhs_type=COLUMN ma rhs_col è vuoto (obbligatorio)"
-                )
-            if rhs_value != "":
-                issues.append(
-                    f"[{cid}] rhs_type=COLUMN ma rhs_value='{rhs_value}' non deve essere valorizzato"
-                )
-
-        elif rhs_type == "VALUE":
-            if rhs_value == "":
-                issues.append(
-                    f"[{cid}] rhs_type=VALUE ma rhs_value è vuoto (obbligatorio)"
-                )
-            if rhs_col != "":
-                issues.append(
-                    f"[{cid}] rhs_type=VALUE ma rhs_col='{rhs_col}' (deve essere vuoto)"
-                )
-
-        else:
-            # rhs_type non riconosciuto (utile per typo in Excel)
-            issues.append(
-                f"[{cid}] rhs_type='{rhs_type}' non riconosciuto (attesi: VALUE/COLUMN/LIST)"
-            )
-
-    return issues
-
-
-def coerce_required_indicators(df: pd.DataFrame, required_indicators: Sequence[str]) -> pd.DataFrame:
-    """
-    Converte a numerico (quando possibile) SOLO le colonne richieste dalla strategia.
-    Evita confronti stringa-stringa per operatori > < between.
-    """
+def coerce_required_indicators(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
     out = df.copy()
-    for col in required_indicators:
-        if col not in out.columns:
-            continue
-
-        # Normalizza virgola decimale prima di tentare cast
-        s = out[col].astype(str).str.replace(",", ".", regex=False).str.strip()
-
-        # errors="ignore" mantiene stringhe quando non è numerico
-        out[col] = pd.to_numeric(s, errors="ignore")
-
+    for c in cols:
+        if c in out.columns:
+            out[c] = _safe_numeric_series(out[c])
     return out
 
 
 # ============================================================
-# APPLY SIGNALS + HOLD/VALUE
+# SIGNAL COMPUTATION (ENGINE WRAPPER)
 # ============================================================
-def apply_signals(df: pd.DataFrame, strategy: Strategy) -> pd.DataFrame:
-    df_out = df.copy()
-    signal_all = pd.Series(index=df_out.index, dtype="object")
+def debug_conditions_true_rate(df: pd.DataFrame, conditions: List[Any], max_rows: int = 5) -> None:
+    """
+    Stampa, per ogni condition enabled, quante righe risultano True.
+    Nota: questa è diagnostica, non la logica ufficiale dell'engine.
+    """
+    print("\n[DBG] CONDITION TRUE-RATE")
+    for i, c in enumerate(conditions, 1):
+        if not getattr(c, "enabled", False):
+            continue
 
-    for (_gk1, _gk2), g in iter_groups(df_out):
-        s = compute_signal(g.copy(), strategy)
+        lhs = str(getattr(c, "lhs_col", "")).strip()
+        # engine/Condition può usare 'operator' o 'op' a seconda dell'implementazione
+        op = str(getattr(c, "operator", getattr(c, "op", ""))).strip().upper()
+        rhs_type = str(getattr(c, "rhs_type", "")).strip().upper()
+        rhs_col = str(getattr(c, "rhs_col", "")).strip()
+        rhs_val = getattr(c, "rhs_value", None)
 
-        if not isinstance(s, pd.Series):
-            graceful_exit("ERRORE: compute_signal non ha restituito una pandas.Series.", code=2)
-        if len(s) != len(g):
-            graceful_exit(
-                f"ERRORE: compute_signal ha restituito {len(s)} valori ma il gruppo ha {len(g)} righe.",
-                code=2,
+        if lhs not in df.columns:
+            print(f"  {i}. MISSING lhs_col={lhs!r}")
+            continue
+
+        sL = df[lhs]
+
+        if rhs_type == "COLUMN":
+            if rhs_col not in df.columns:
+                print(f"  {i}. MISSING rhs_col={rhs_col!r} (lhs={lhs!r} op={op})")
+                continue
+            sR = df[rhs_col]
+        else:
+            sR = rhs_val
+
+        try:
+            if op in ("==", "="):
+                mask = (sL == sR)
+            elif op == "!=":
+                mask = (sL != sR)
+            elif op == ">":
+                mask = (sL > sR) if rhs_type == "COLUMN" else (sL > float(str(sR).replace(",", ".")))
+            elif op == ">=":
+                mask = (sL >= sR) if rhs_type == "COLUMN" else (sL >= float(str(sR).replace(",", ".")))
+            elif op == "<":
+                mask = (sL < sR) if rhs_type == "COLUMN" else (sL < float(str(sR).replace(",", ".")))
+            elif op == "<=":
+                mask = (sL <= sR) if rhs_type == "COLUMN" else (sL <= float(str(sR).replace(",", ".")))
+            else:
+                print(f"  {i}. UNSUPPORTED op={op!r} lhs={lhs!r} rhs_type={rhs_type!r} rhs={rhs_col or rhs_val!r}")
+                continue
+
+            true_n = int(mask.fillna(False).sum())
+            tot = int(len(mask))
+            pct = 100.0 * true_n / tot if tot else 0.0
+            sample_idx = mask[mask.fillna(False)].head(max_rows).index.tolist()
+            print(
+                f"  {i}. lhs={lhs!r} op={op!r} rhs={rhs_col or rhs_val!r} -> TRUE {true_n}/{tot} ({pct:.2f}%) sample_idx={sample_idx}"
             )
 
-        s = s.astype(str).str.strip().str.upper()
-        bad = sorted(set(s.unique()) - ALLOWED_SIGNALS)
-        if bad:
-            graceful_exit(
-                f"ERRORE: compute_signal ha prodotto valori non ammessi: {bad}. "
-                f"Valori ammessi: {sorted(ALLOWED_SIGNALS)}",
-                code=2,
-            )
-
-        signal_all.loc[g.index] = s.values
-
-    df_out["SIGNAL"] = signal_all
-    return df_out
+        except Exception as e:
+            print(f"  {i}. ERROR eval lhs={lhs!r} op={op!r} rhs={rhs_col or rhs_val!r}: {e!r}")
 
 
+def compute_signal(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> pd.Series:
+    print("[DBG] compute_signal ENTER debug=", debug, "rows=", len(df))  # TEMP (sempre)
+
+    out = generate_signals(
+        df,
+        strategy.conditions,
+        reverse_immediate=True,
+        exit_priority=True,
+    )
+
+    if "position" not in out.columns:
+        raise ValueError("generate_signals non ha prodotto la colonna 'position'.")
+
+    if debug:
+        debug_conditions_true_rate(df, strategy.conditions)
+        print("[DBG] engine position dtype:", out["position"].dtype)
+        print("[DBG] engine position head:", out["position"].head(15).tolist())
+        print(
+            "[DBG] engine position vc:",
+            out["position"].astype(str).value_counts(dropna=False).head(10).to_dict(),
+        )
+
+    pos = pd.to_numeric(out["position"], errors="coerce")
+    pos_i = pos.fillna(0).astype(int)
+
+    sig = (
+        pos_i.map({1: "LONG", -1: "SHORT", 0: "NEUTRAL"})
+        .fillna("NEUTRAL")
+        .astype("object")
+    )
+    sig.index = df.index
+    return sig
+
+
+def apply_signals(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> pd.DataFrame:
+    out = df.copy()
+
+    print("[DBG] apply_signals debug=", debug, "rows=", len(out))  # TEMP
+
+    sig_all = pd.Series("NEUTRAL", index=out.index, dtype="object")
+
+    groups = list(iter_groups(out))
+    print("[DBG] iter_groups count =", len(groups))  # TEMP
+    for k, g in groups[:3]:
+        print("[DBG] group sample:", k, "rows=", len(g))  # TEMP
+
+    for key, g in groups:
+        s = compute_signal(g.copy(), strategy, debug=debug)
+
+        s = _norm_str_series(s).fillna("NEUTRAL")
+        s = s.reindex(g.index).fillna("NEUTRAL")
+
+        sig_all.loc[g.index] = s
+
+        if debug:
+            print(f"[DBG] group={key} signal vc:", s.value_counts(dropna=False).head(5).to_dict())
+
+    out["SIGNAL"] = sig_all
+    return out
+
+
+# ============================================================
+# HOLD + VALUE
+# ============================================================
 def apply_hold_value(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
-    """
-    HOLD binario con logica evento:
-      - LONG  => HOLD diventa IN (se non già IN)
-      - SHORT => HOLD diventa OUT (se non già OUT)
-      - NEUTRAL => nessun cambio (HOLD resta invariato)
+    out = df.copy()
+    out["HOLD"] = HOLD_OUT
+    out["VALUE"] = math.nan
 
-    VALUE:
-      - valorizzata SOLO quando HOLD cambia (evento)
-      - VALUE = close della stessa riga dell'evento
-      - altrimenti vuota (NaN)
-    """
-    df_out = df.copy()
-    df_out["HOLD"] = HOLD_OUT
-    df_out["VALUE"] = math.nan  # mantiene dtype float
+    entry, exit_ = 0, 0
 
-    entry_in = 0
-    exit_out = 0
+    for _, g in iter_groups(out):
+        hold = HOLD_OUT
+        for i in g.index:
+            sig = str(out.at[i, "SIGNAL"]).strip().upper()
+            close = out.at[i, "close"]
 
-    for (_gk1, _gk2), g in iter_groups(df_out):
-        idx = list(g.index)
+            if sig == "LONG" and hold != HOLD_IN:
+                hold = HOLD_IN
+                out.at[i, "VALUE"] = close
+                entry += 1
 
-        hold_state = HOLD_OUT
-        hold_col: List[str] = []
-        value_col: List[float] = []
+            elif sig == "SHORT" and hold != HOLD_OUT:
+                hold = HOLD_OUT
+                out.at[i, "VALUE"] = close
+                exit_ += 1
 
-        for i in idx:
-            sig = str(df_out.at[i, "SIGNAL"]).upper()
-            close = float(df_out.at[i, "close"])
+            out.at[i, "HOLD"] = hold
 
-            v = math.nan  # default: cella vuota
-
-            if sig == "LONG":
-                if hold_state != HOLD_IN:
-                    hold_state = HOLD_IN
-                    entry_in += 1
-                    v = close  # evento: entry
-
-            elif sig == "SHORT":
-                if hold_state != HOLD_OUT:
-                    hold_state = HOLD_OUT
-                    exit_out += 1
-                    v = close  # evento: exit
-
-            # NEUTRAL: nessun cambio
-
-            hold_col.append(hold_state)
-            value_col.append(v)
-
-        df_out.loc[idx, "HOLD"] = hold_col
-        df_out.loc[idx, "VALUE"] = value_col
-
-    # forza numerico e mantiene NaN per celle vuote
-    df_out["VALUE"] = pd.to_numeric(df_out["VALUE"], errors="coerce")
-
-    return df_out, entry_in, exit_out
-
-
+    return out, entry, exit_
 
 
 # ============================================================
-# OUTPUT + SUMMARY
+# OUTPUT
 # ============================================================
-def build_output_path(kpi_path: Path, output_dir: Optional[Path] = None) -> Path:
-    out_dir = output_dir if output_dir is not None else kpi_path.parent
+def build_output_path_in_dir(kpi: Path, out_dir: Path) -> Path:
+    name = kpi.name
+    if not name.startswith("SIGNAL_"):
+        name = "SIGNAL_" + name
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    name = kpi_path.name
-    out_name = ("SIGNAL_" + name) if not name.upper().startswith("SIGNAL_") else name
-    return out_dir / out_name
+    return out_dir / name
 
 
-def write_output_csv(df: pd.DataFrame, out_path: Path) -> None:
+def write_output_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(
-        out_path,
+        path,
         sep=CSV_SEP,
         index=False,
-        decimal=",",          # virgola decimale
-        na_rep="",            # NaN => cella vuota
-        float_format="%.3f",  # se vuoi 3 decimali come 26,355
+        decimal=",",
+        na_rep="",
+        float_format="%.3f",
     )
 
 
-
-
-
-def print_summary(df: pd.DataFrame, entry_in: int, exit_out: int) -> None:
-    total = len(df)
-    counts = df["SIGNAL"].value_counts(dropna=False).to_dict()
-    long_n = int(counts.get("LONG", 0))
-    short_n = int(counts.get("SHORT", 0))
-    neutral_n = int(counts.get("NEUTRAL", 0))
-
+def print_summary(df: pd.DataFrame, entry: int, exit_: int) -> None:
+    vc = df["SIGNAL"].value_counts(dropna=False).to_dict() if "SIGNAL" in df.columns else {}
     print("\n===== RIEPILOGO =====")
-    print(f"Righe elaborate: {total}")
-    print(f"Conteggi SIGNAL: LONG={long_n}  SHORT={short_n}  NEUTRAL={neutral_n}")
-    print(f"Cambi HOLD OUT->IN: {entry_in}")
-    print(f"Cambi HOLD IN->OUT: {exit_out}")
-
-
+    print(f"Righe: {len(df)}")
+    print(f"LONG={vc.get('LONG', 0)} SHORT={vc.get('SHORT', 0)} NEUTRAL={vc.get('NEUTRAL', 0)}")
+    print(f"IN={entry} OUT={exit_}")
 
 
 # ============================================================
-# FLOW INTERATTIVO
+# FLOW
 # ============================================================
 @dataclass(frozen=True)
 class Selection:
-    kpi_path: Path
-    strategy_path: Path
+    kpi: Path
+    strategy: Path
+
+
+def _auto_pick_kpi() -> Optional[Path]:
+    if ENV_KPI_FILE and ENV_KPI_FILE.exists():
+        return ENV_KPI_FILE
+    return None
+
+
+def run_strategy_preflight_or_reject(strategy_path: Path, df_kpi: pd.DataFrame) -> bool:
+    """
+    Single source of truth del preflight:
+    - usa qc_strategy_preflight (strategy_qc.py)
+    - stampa SEMPRE la tabella (stessa identica dello stand-alone)
+    - scrive QC_*.csv vicino alla strategia + copia in OUT_DIR/TEST_DATA_DIR
+    - ritorna True se no ERROR, False se ERROR
+      (in PIPELINE_MODE esce con code 2)
+    """
+    if qc_strategy_preflight is None or _print_qc_summary is None:
+        print("⚠️ QC non disponibile (strategy_qc.py non importabile).")
+        if _QC_IMPORT_ERR is not None:
+            print(f"   Dettaglio import QC: {_QC_IMPORT_ERR!r}")
+        if PIPELINE_MODE:
+            graceful_exit("QC non disponibile in PIPELINE_MODE: impossibile garantire robustezza strategia.", 2)
+        return True
+
+    strategy_path = Path(strategy_path).resolve()
+
+    qc_df, issues = qc_strategy_preflight(
+        strategy_xlsx=strategy_path,
+        kpi_columns=list(df_kpi.columns),
+        sheet_name="CONDITIONS",
+        strict_logic_support=False,
+    )
+
+    # ------------------------------------------------------------
+    # STAMPA TABELLARE (OBBLIGATORIA) — stessa dello stand-alone
+    # ------------------------------------------------------------
+    n_err = _print_qc_summary(qc_df, issues)
+
+    # ------------------------------------------------------------
+    # Scrittura report QC
+    # ------------------------------------------------------------
+    qc_out1 = strategy_path.with_name(f"QC_{strategy_path.stem}.csv")
+    qc_df.to_csv(qc_out1, sep=";", index=False)
+    print(f"\n[STRATEGY_QC] Report scritto: {qc_out1}")
+
+    base_out = (ENV_OUT_DIR if ENV_OUT_DIR else TEST_DATA_DIR)
+    qc_out2 = Path(base_out) / f"QC_{strategy_path.stem}.csv"
+    if qc_out2.resolve() != qc_out1.resolve():
+        qc_df.to_csv(qc_out2, sep=";", index=False)
+        print(f"[STRATEGY_QC] Copia report: {qc_out2}")
+
+    # ------------------------------------------------------------
+    # Esito
+    # ------------------------------------------------------------
+    if n_err > 0:
+        if PIPELINE_MODE:
+            graceful_exit("Config strategia invalida (QC ERROR) in PIPELINE_MODE.", 2)
+        return False
+
+    return True
+
+
+
+def _auto_pick_strategy(df_kpi: pd.DataFrame) -> Optional[Path]:
+    if ENV_STRATEGY_FILE and ENV_STRATEGY_FILE.exists():
+        strat = ENV_STRATEGY_FILE
+
+        if not run_strategy_preflight_or_reject(strat, df_kpi):
+            print("⚠️ Strategia da pipeline rifiutata: QC ERROR nel file.")
+            return None
+
+        strategy = load_strategy(str(strat))
+        missing = [c for c in strategy.required_indicators if c not in df_kpi.columns]
+        if not missing:
+            return strat
+
+        print("⚠️ Strategia da pipeline non compatibile (indicatori mancanti):", ", ".join(missing))
+
+    return None
 
 
 def interactive_selection() -> Selection:
-    kpi_files = list_files(TEST_DATA_DIR, exts=["csv"])
-    kpi_path = select_from_menu("Su quale file vuoi testare la strategia?", kpi_files)
+    data_dir = ENV_DATA_DIR if ENV_DATA_DIR else TEST_DATA_DIR
 
-    # carica KPI una sola volta; se mancano indicatori riparte solo dalla strategia
-    df_kpi = load_kpi_csv(kpi_path)
+    kpi = _auto_pick_kpi()
+    if kpi is None:
+        kpi = select_from_menu(
+            "Su quale file vuoi testare la strategia? (solo KPI_*.csv)",
+            list_kpi_files_only(data_dir),
+        )
 
-    # Strategie: filtra per .xlsx visto il tuo engine
-    strategy_files = list_files(STRATEGY_DIR, exts=["xlsx"])
+    df_kpi = load_kpi_csv(kpi)
+
+    # In QC-only non facciamo auto-pick strategy basato su required indicators
+    if not PREFLIGHT_ONESHOT:
+        strat = _auto_pick_strategy(df_kpi)
+        if strat is not None:
+            return Selection(kpi, strat)
 
     while True:
-        strategy_path = select_from_menu("Quale strategia vuoi utilizzare?", strategy_files)
+        strat = select_from_menu(
+            f"Quale strategia vuoi utilizzare?\n(directory: {STRATEGY_DIR})",
+            list_files(STRATEGY_DIR, ["xlsx"]),
+        )
 
-        try:
-            strategy = load_strategy(str(strategy_path))
-        except ValueError as e:
-            print("\nSTRATEGIA NON VALIDA (validazione engine):")
-            print(str(e))
-
-            # Diagnostica aggiuntiva (lista errori potenziali nel foglio)
-            issues = diagnose_strategy_xlsx(strategy_path, sheet_name="CONDITIONS")
-            if issues:
-                print("\nDettaglio problemi trovati nel file Excel:")
-                for msg in issues[:50]:
-                    print(" - " + msg)
-                if len(issues) > 50:
-                    print(f" ... ({len(issues) - 50} altri problemi non mostrati)")
-            print("\nRipeti la selezione della strategia (punto 2).")
+        if not run_strategy_preflight_or_reject(strat, df_kpi):
+            print("⚠️ Strategia rifiutata: correggi gli ERROR nel foglio CONDITIONS.")
             continue
 
-        missing = validate_required_indicators(df_kpi, strategy.required_indicators)
+        # QC-only: NON caricare engine/strategy (evita crash Condition/notes)
+        if PREFLIGHT_ONESHOT:
+            return Selection(kpi, strat)
 
-        if missing:
-            print(
-                "\nATTENZIONE IL FILE CONFIG_STRATEGY RICHIAMA INDICATORI NON PRESENTI: "
-                + ", ".join(missing)
-            )
-            print("Ripeti la selezione della strategia (punto 2).")
-            continue
+        # Run normale: dopo QC OK carichiamo strategia e controlliamo indicatori richiesti
+        strategy = load_strategy(str(strat))
+        missing = [c for c in strategy.required_indicators if c not in df_kpi.columns]
+        if not missing:
+            return Selection(kpi, strat)
 
-        return Selection(kpi_path=kpi_path, strategy_path=strategy_path)
+        print("Indicatori mancanti nel KPI:", ", ".join(missing))
 
-
-def run_once(selection: Selection, output_dir: Optional[Path] = None) -> None:
-    df = load_kpi_csv(selection.kpi_path)
-    strategy = load_strategy(str(selection.strategy_path))
-
-    # MUST: cast indicatori richiesti per confronti numerici corretti
-    df = coerce_required_indicators(df, strategy.required_indicators)
-
-    df = apply_signals(df, strategy)
-    df, entry_in, exit_out = apply_hold_value(df)
-
-
-    out_path = build_output_path(selection.kpi_path, output_dir=output_dir)
-    write_output_csv(df, out_path)
-
-    print(f"\nOutput scritto: {out_path}")
-    print_summary(df, entry_in, exit_out)
 
 
 def main() -> None:
+    print("[DBG] RUNNING FILE:", __file__)
+
     ensure_engine_available()
-    try:
-        selection = interactive_selection()
-        run_once(selection, output_dir=None)
-    except KeyboardInterrupt:
-        print("\nInterruzione richiesta (Ctrl+C). Uscita senza errori.")
-        raise SystemExit(0)
+
+    # ------------------------------------------------------------
+    # MODALITÀ QC-ONLY (richiamata da pipeline opzione 7)
+    # ------------------------------------------------------------
+    if PREFLIGHT_ONESHOT:
+        # Interattivo: scegli KPI + strategia, fai QC, scrivi report, poi esci.
+        sel = interactive_selection()
+
+        strategy_path = Path(sel.strategy).resolve()
+        kpi_path = Path(sel.kpi).resolve()
+
+        print(f"[DBG] QC-ONLY Selected strategy = {strategy_path}")
+        print(f"[DBG] QC-ONLY Selected KPI      = {kpi_path}")
+
+        df = load_kpi_csv(kpi_path)
+
+        ok = run_strategy_preflight_or_reject(strategy_path, df)
+        # In QC-only: exit code 0 se ok, 2 se error (pipeline già protegge e torna al menu)
+        raise SystemExit(0 if ok else 2)
+
+    # ------------------------------------------------------------
+    # RUN NORMALE (genera SIGNAL)
+    # ------------------------------------------------------------
+    sel = interactive_selection()
+
+    strategy_path = Path(sel.strategy).resolve()
+    kpi_path = Path(sel.kpi).resolve()
+
+    print(f"[DBG] Selected strategy file = {strategy_path}")
+    st = strategy_path.stat()
+    print(f"[DBG] Strategy mtime={st.st_mtime} size={st.st_size} bytes")
+
+    df = load_kpi_csv(kpi_path)
+
+
+    # SOLO SE QC OK → carica strategia
+    strategy = load_strategy(str(strategy_path))
+
+    # Coerce only required indicators (engine comparisons become deterministic)
+    df = coerce_required_indicators(df, strategy.required_indicators)
+
+    missing = [c for c in strategy.required_indicators if c not in df.columns]
+    if missing:
+        print("[WARN] Missing required indicators:", ", ".join(missing))
+
+    debug_engine = True  # metti False quando hai finito il debug
+
+    groups = list(iter_groups(df))
+    print("[DBG] iter_groups count =", len(groups))
+    for k, g in groups[:3]:
+        print("[DBG] group sample:", k, "rows=", len(g))
+
+    df = apply_signals(df, strategy, debug=debug_engine)
+
+    print("[DBG] SIGNAL dtype:", df["SIGNAL"].dtype if "SIGNAL" in df.columns else None)
+    print("[DBG] SIGNAL notna ratio:", float(df["SIGNAL"].notna().mean()) if "SIGNAL" in df.columns else None)
+    print("[DBG] SIGNAL head:", df["SIGNAL"].head(10).tolist() if "SIGNAL" in df.columns else None)
+    print(
+        "[DBG] SIGNAL vc:",
+        df["SIGNAL"].value_counts(dropna=False).head(10).to_dict() if "SIGNAL" in df.columns else None,
+    )
+
+    df, entry, exit_ = apply_hold_value(df)
+
+    df = normalize_signal_hold(df)
+
+    out_dir = ENV_OUT_DIR if ENV_OUT_DIR else sel.kpi.parent
+    out = build_output_path_in_dir(sel.kpi, out_dir)
+
+    write_output_csv(df, out)
+
+    print(f"\nOutput scritto: {out}")
+    print_summary(df, entry, exit_)
+
 
 
 if __name__ == "__main__":
     main()
-

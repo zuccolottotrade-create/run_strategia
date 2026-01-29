@@ -13,3 +13,6 @@ __pycache__/
 
 # Output generati
 SIGNAL_*.csv
+
+# local docs
+*.pdf
