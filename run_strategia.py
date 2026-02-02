@@ -174,6 +174,217 @@ def normalize_signal_hold(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ============================================================
+# TRADE ENRICHMENT (Profit/Trade, Trade_ID, Timing, Frequency)
+# ============================================================
+def _detect_datetime_series(df: pd.DataFrame) -> pd.Series | None:
+    """
+    Tries to build a datetime Series from common column conventions.
+    Supported:
+      - 'datetime' / 'DateTime' / 'timestamp'
+      - 'date' + 'time'
+    Returns pd.Series[datetime64[ns]] or None.
+    """
+    cols = {c.lower(): c for c in df.columns}
+
+    # single column datetime
+    for key in ("datetime", "date_time", "timestamp"):
+        if key in cols:
+            s = pd.to_datetime(df[cols[key]], errors="coerce", utc=False)
+            if s.notna().any():
+                return s
+
+    # date + time
+    if "date" in cols and "time" in cols:
+        s = pd.to_datetime(
+            df[cols["date"]].astype(str).str.strip() + " " + df[cols["time"]].astype(str).str.strip(),
+            errors="coerce",
+            utc=False,
+        )
+        if s.notna().any():
+            return s
+
+    return None
+
+
+def add_trade_enrichment(
+    df: pd.DataFrame,
+    trading_day_minutes: float = 480.0,   # 8h
+    trading_days_per_week: float = 5.0,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Adds trade-based columns without altering existing interactivity.
+    Trade pairing logic:
+      - ENTRY when HOLD == 'IN' and VALUE is present
+      - EXIT  when HOLD == 'OUT' and VALUE is present and an ENTRY exists
+    Output columns:
+      - Profit/Trade (on EXIT row only)
+      - Trade_ID (on EXIT row only)
+      - Minutes_IN_to_OUT (on EXIT row only, if datetime available)
+      - Minutes_OUT_to_next_IN (on ENTRY row only, if datetime available)
+      - Sum Profit/Trade, Avg Profit/Trade, Win Rate
+      - Max DD Start, Max DD Peak
+      - Trades/Day_8h_AvgIdle, Trades/Day_8h_MedIdle, Trades/Week_8h_AvgIdle, Trades/Week_8h_MedIdle (constant)
+    Returns: (df_enriched, summary_dict)
+    """
+    out = df.copy()
+
+    # Ensure required columns exist
+    if "HOLD" not in out.columns or "VALUE" not in out.columns:
+        # nothing to do
+        return out, {}
+
+    hold = out["HOLD"].astype("object")
+    value = out["VALUE"]
+
+    dt = _detect_datetime_series(out)
+
+    # Pre-allocate columns
+    profit = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+    trade_id = pd.Series([pd.NA] * len(out), index=out.index, dtype="Int64")
+
+    dur_in_out = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+    dur_out_next_in = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+
+    sum_profit = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+    avg_profit = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+    win_rate = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+
+    max_dd_start = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+    max_dd_peak = pd.Series([pd.NA] * len(out), index=out.index, dtype="Float64")
+
+    # State
+    entry_value = None
+    entry_time = None
+    last_exit_time = None
+
+    equity = 0.0
+    equity_start = 0.0
+    peak_equity = 0.0
+
+    n_trades = 0
+    n_wins = 0
+    mdd_start = 0.0
+    mdd_peak = 0.0
+
+    trade_counter = 0
+
+    # Iterate rows in order
+    for i in out.index:
+        h = str(hold.loc[i]).upper() if not pd.isna(hold.loc[i]) else ""
+        v = value.loc[i]
+        v_num = None
+        if not pd.isna(v):
+            try:
+                v_num = float(v)
+            except Exception:
+                v_num = None
+
+        t = None
+        if dt is not None:
+            t = dt.loc[i]
+            if pd.isna(t):
+                t = None
+
+        # ENTRY event
+        if h == "IN" and v_num is not None:
+            entry_value = v_num
+            entry_time = t
+
+            # OUT -> next IN (idle)
+            if last_exit_time is not None and t is not None:
+                dur_out_next_in.loc[i] = (t - last_exit_time).total_seconds() / 60.0
+
+        # EXIT event
+        if h == "OUT" and v_num is not None and entry_value is not None:
+            p = v_num - entry_value
+            equity += p
+
+            trade_counter += 1
+            trade_id.loc[i] = trade_counter
+            profit.loc[i] = p
+
+            n_trades += 1
+            if p > 0:
+                n_wins += 1
+
+            # IN -> OUT duration
+            if entry_time is not None and t is not None:
+                dur_in_out.loc[i] = (t - entry_time).total_seconds() / 60.0
+
+            # DD from start
+            dd_s = max(0.0, equity_start - equity)
+            mdd_start = max(mdd_start, dd_s)
+
+            # DD from peak
+            peak_equity = max(peak_equity, equity)
+            dd_p = peak_equity - equity
+            mdd_peak = max(mdd_peak, dd_p)
+
+            last_exit_time = t
+
+            # reset
+            entry_value = None
+            entry_time = None
+
+        # Running metrics every row (so the report can read last row)
+        sum_profit.loc[i] = equity
+        if n_trades > 0:
+            avg_profit.loc[i] = equity / n_trades
+            win_rate.loc[i] = n_wins / n_trades
+        max_dd_start.loc[i] = mdd_start
+        max_dd_peak.loc[i] = mdd_peak
+
+    # Attach columns
+    out["Profit/Trade"] = profit
+    out["Trade_ID"] = trade_id
+    out["Minutes_IN_to_OUT"] = dur_in_out
+    out["Minutes_OUT_to_next_IN"] = dur_out_next_in
+
+    out["Sum Profit/Trade"] = sum_profit
+    out["Avg Profit/Trade"] = avg_profit
+    out["Win Rate"] = win_rate
+    out["Max DD Start"] = max_dd_start
+    out["Max DD Peak"] = max_dd_peak
+
+    # Frequency (8h/day) using idle minutes
+    idle_vals = dur_out_next_in.dropna().astype(float)
+    avg_idle = float(idle_vals.mean()) if len(idle_vals) else None
+    med_idle = float(idle_vals.median()) if len(idle_vals) else None
+
+    def safe_div(a, b):
+        if b is None or b == 0:
+            return None
+        return a / b
+
+    trades_day_avg = safe_div(trading_day_minutes, avg_idle)
+    trades_day_med = safe_div(trading_day_minutes, med_idle)
+    trades_week_avg = (trades_day_avg * trading_days_per_week) if trades_day_avg is not None else None
+    trades_week_med = (trades_day_med * trading_days_per_week) if trades_day_med is not None else None
+
+    # Constant columns (same value on all rows)
+    out["Trades/Day_8h_AvgIdle"] = trades_day_avg
+    out["Trades/Day_8h_MedIdle"] = trades_day_med
+    out["Trades/Week_8h_AvgIdle"] = trades_week_avg
+    out["Trades/Week_8h_MedIdle"] = trades_week_med
+
+    # Summary dict for reporting / console
+    trade_dur_vals = dur_in_out.dropna().astype(float)
+    summary = {
+        "trades_closed": int(trade_counter),
+        "avg_trade_minutes": float(trade_dur_vals.mean()) if len(trade_dur_vals) else None,
+        "med_trade_minutes": float(trade_dur_vals.median()) if len(trade_dur_vals) else None,
+        "avg_idle_minutes": avg_idle,
+        "med_idle_minutes": med_idle,
+        "trades_day_8h_avg_idle": trades_day_avg,
+        "trades_day_8h_med_idle": trades_day_med,
+        "trades_week_8h_avg_idle": trades_week_avg,
+        "trades_week_8h_med_idle": trades_week_med,
+    }
+
+    return out, summary
+
+
 def coerce_numeric_eu_inplace(df: pd.DataFrame, cols: List[str]) -> None:
     """
     Convert EU formatted numeric strings to floats.
@@ -765,6 +976,8 @@ def main() -> None:
 
     df = normalize_signal_hold(df)
 
+    df, trade_summary = add_trade_enrichment(df, trading_day_minutes=480.0, trading_days_per_week=5.0)
+
     out_dir = ENV_OUT_DIR if ENV_OUT_DIR else sel.kpi.parent
     out = build_output_path_in_dir(sel.kpi, out_dir)
 
@@ -773,6 +986,28 @@ def main() -> None:
     print(f"\nOutput scritto: {out}")
     print_summary(df, entry, exit_)
 
+    # ------------------------------------------------------------
+    # Trade frequency summary (8h/day)
+    # ------------------------------------------------------------
+    if isinstance(trade_summary, dict) and trade_summary:
+        print("\n===== TRADE FREQUENCY (8h/day) =====")
+        print(f"Trades closed: {trade_summary.get('trades_closed')}")
+        print(f"Avg trade duration (min): {trade_summary.get('avg_trade_minutes')}")
+        print(f"Median trade duration (min): {trade_summary.get('med_trade_minutes')}")
+        print(f"Avg idle OUT->next IN (min): {trade_summary.get('avg_idle_minutes')}")
+        print(f"Median idle OUT->next IN (min): {trade_summary.get('med_idle_minutes')}")
+        print(f"Trades/day (avg idle): {trade_summary.get('trades_day_8h_avg_idle')}")
+        print(f"Trades/day (median idle): {trade_summary.get('trades_day_8h_med_idle')}")
+        print(f"Trades/week 5d (avg): {trade_summary.get('trades_week_8h_avg_idle')}")
+        print(f"Trades/week 5d (median): {trade_summary.get('trades_week_8h_med_idle')}")
+
+        # write compact CSV for Report_Strategia
+        try:
+            summary_path = out.with_name(f"TRADE_FREQ_{out.stem}.csv")
+            pd.DataFrame([trade_summary]).to_csv(summary_path, sep=";", index=False, decimal=",")
+            print(f"[OK] Trade summary scritto: {summary_path}")
+        except Exception as e:
+            print(f"[WARN] Impossibile scrivere TRADE_FREQ_*.csv: {e!r}")
 
 
 if __name__ == "__main__":
