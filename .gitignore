@@ -1,24 +1,39 @@
-# PyCharm
+########################
+# IDE / OS
+########################
 .idea/
-
-# Virtualenv
-.venv/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# macOS
 .DS_Store
 
-# Output generati
+########################
+# Virtualenv
+########################
+.venv/
+
+########################
+# Python cache
+########################
+__pycache__/
+*.pyc
+*.pyo
+
+########################
+# Generated outputs
+########################
 SIGNAL_*.csv
 
-# local docs
+########################
+# Local documents
+########################
 *.pdf
 
-# local docs
-*.pdf
+########################
+# Local backups / variants (DO NOT VERSION)
+########################
+*.bak.py
+*.bak_*.py
+*_updated.py
+*_interactive_*.py
+*_PIPELINE_*.py
+*_maxdd_*.py
+*_dd_*.py
 
-# local docs
-*.pdf
