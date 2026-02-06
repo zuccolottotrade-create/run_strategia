@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
+import numpy as np
 
 # ============================================================
 # IMPORT SUITE
@@ -76,7 +77,7 @@ ENV_KPI_FILE = _env_path("PY_SUITE_KPI_INPUT_CSV")
 # ============================================================
 PY_SUITE_ROOT = Path(os.environ.get("PY_SUITE_ROOT", str(SUITE_ROOT))).resolve()
 
-TEST_DATA_DIR = DATA_DIR
+TEST_DATA_DIR = (DATA_DIR / "Test Data").resolve()
 DEFAULT_STRATEGY_DIR = PY_SUITE_ROOT / "_data" / "config_strategia"
 STRATEGY_DIR = (ENV_STRATEGY_DIR if ENV_STRATEGY_DIR else DEFAULT_STRATEGY_DIR).resolve()
 STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
@@ -413,40 +414,55 @@ def coerce_numeric_eu_inplace(df: pd.DataFrame, cols: List[str]) -> None:
 
 
 def normalize_supertrend_direction(df: pd.DataFrame) -> None:
-    """
-    Normalizes/creates:
-      - supertrend_dir      as Int64 (+1 / -1)
-      - supertrend_dir_txt  as "UP"/"DOWN"
-
-    Priority:
-      1) If supertrend_dir exists and is numeric-like, use it
-      2) Else, if supertrend_dir_txt exists, map it
-      3) Else, if close & supertrend exist, derive direction from close > supertrend
-    """
+    # normalizza eventuale txt esistente
     if "supertrend_dir_txt" in df.columns:
         df["supertrend_dir_txt"] = _norm_str_series(df["supertrend_dir_txt"])
 
+    # garantisci colonna target
     if "supertrend_dir" not in df.columns:
         df["supertrend_dir"] = pd.Series([pd.NA] * len(df), dtype="Int64")
 
-    sdir_raw = _norm_str_series(df["supertrend_dir"])
-    sdir_num = pd.to_numeric(sdir_raw.str.replace(",", ".", regex=False), errors="coerce")
-    if sdir_num.notna().mean() >= 0.5:
-        df["supertrend_dir"] = sdir_num.astype("Int64")
-    else:
-        if "supertrend_dir_txt" in df.columns:
-            m_txt = {"UP": 1, "DOWN": -1, "LONG": 1, "SHORT": -1}
-            mapped = df["supertrend_dir_txt"].map(m_txt)
-            if mapped.notna().mean() >= 0.5:
-                df["supertrend_dir"] = mapped.astype("Int64")
+    # ------------------------------------------------------------
+    # 1) Prova a popolare da supertrend_dir (se già presente e sensata)
+    # 2) Altrimenti: usa KPI_SUPERTREND_DIR_* (es. KPI_SUPERTREND_DIR_10_3p0)
+    # ------------------------------------------------------------
+    candidates = [("supertrend_dir", df["supertrend_dir"])]
+    kpi_dir_cols = sorted([c for c in df.columns if c.startswith("KPI_SUPERTREND_DIR_")])
+    if kpi_dir_cols:
+        candidates.append((kpi_dir_cols[0], df[kpi_dir_cols[0]]))
 
+    filled = False
+    for src_name, src in candidates:
+        s_norm = _norm_str_series(src)
+        s_num = pd.to_numeric(s_norm.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+        # se è valorizzata abbastanza, la usiamo
+        if s_num.notna().mean() >= 0.5:
+            s_sign = np.sign(s_num)
+            s_sign = s_sign.replace({0: pd.NA})
+            df["supertrend_dir"] = s_sign.round().astype("Int64")
+            filled = True
+            break
+
+    # fallback: mappa dal testo
+    if (not filled) and "supertrend_dir_txt" in df.columns:
+        m_txt = {"UP": 1, "DOWN": -1, "LONG": 1, "SHORT": -1}
+        mapped = df["supertrend_dir_txt"].map(m_txt)
+        if mapped.notna().mean() >= 0.5:
+            df["supertrend_dir"] = mapped.astype("Int64")
+            filled = True
+
+    # fallback finale: deriva da close vs supertrend (solo dove mancante)
     if df["supertrend_dir"].isna().any() and {"close", "supertrend"}.issubset(df.columns):
         mask = df["supertrend_dir"].isna() & df["close"].notna() & df["supertrend"].notna()
-        df.loc[mask, "supertrend_dir"] = (df.loc[mask, "close"] > df.loc[mask, "supertrend"]).map(
-            {True: 1, False: -1}
-        ).astype("Int64")
+        df.loc[mask, "supertrend_dir"] = (
+            (df.loc[mask, "close"] > df.loc[mask, "supertrend"])
+            .map({True: 1, False: -1})
+            .astype("Int64")
+        )
 
     df["supertrend_dir_txt"] = df["supertrend_dir"].map({1: "UP", -1: "DOWN"}).astype("object")
+
 
 
 # ============================================================
@@ -539,19 +555,60 @@ def load_kpi_csv(path: Path) -> pd.DataFrame:
         "datetime",
         "exchange",
         "currency",
+        "supertrend_dir",
         "supertrend_dir_txt",
         "SIGNAL",
         "HOLD",
         "VALUE",
     }
+
+    # --- Preserve REGIME_* textual columns (keep *_CODE and *_SWITCH numeric) ---
+    regime_text_cols = [
+        c for c in df.columns
+        if c.startswith("REGIME_") and not (c.endswith("_CODE") or c.endswith("_SWITCH"))
+    ]
+    non_numeric = non_numeric | set(regime_text_cols)
+
     numeric_candidates = [c for c in df.columns if c not in non_numeric]
     coerce_numeric_eu_inplace(df, numeric_candidates)
+
+    # --- QC: REGIME textual columns must not be wiped by coercion ---
+    qc_cols = list(regime_text_cols)
+
+    if qc_cols:
+        wiped = [c for c in qc_cols if df[c].isna().mean() > 0.99]
+        if wiped:
+            raise ValueError(f"[QC] REGIME textual columns wiped by coercion: {wiped}")
 
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     if df["close"].isna().all():
         graceful_exit("Colonna 'close' non convertibile a numerico (verifica separatore/decimali).", 2)
 
     normalize_supertrend_direction(df)
+
+    # ------------------------------------------------------------
+    # COLUMN ORDERING: supertrend_dir* DEVONO stare prima del blocco REGIME_*
+    # Sequenza richiesta:
+    # supertrend_dir, supertrend_dir_txt, REGIME_L1, REGIME_L1_CODE, REGIME_L1_RAW, REGIME_L1_REASON, REGIME_L1_SWITCH
+    # ------------------------------------------------------------
+    st_cols = [c for c in ["supertrend_dir", "supertrend_dir_txt"] if c in df.columns]
+    regime_cols = [c for c in df.columns if c.startswith("REGIME_")]
+
+    if st_cols and regime_cols:
+        first_regime = regime_cols[0]
+        cols = list(df.columns)
+
+        # rimuovi st_cols dall'ordine attuale
+        for c in st_cols:
+            if c in cols:
+                cols.remove(c)
+
+        # inserisci st_cols subito prima del primo REGIME_*
+        idx = cols.index(first_regime)
+        cols = cols[:idx] + st_cols + cols[idx:]
+        df = df[cols]
+
+
 
     dt_raw = df["date"].astype(str).str.strip()
     sample = dt_raw.dropna().head(20).tolist()
@@ -656,11 +713,57 @@ def debug_conditions_true_rate(df: pd.DataFrame, conditions: List[Any], max_rows
 def compute_signal(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> pd.Series:
     print("[DBG] compute_signal ENTER debug=", debug, "rows=", len(df))  # TEMP (sempre)
 
+    # --- generate signals ---
+
+    # --- REGIME_L1 gating ----------------------------------------------
+    use_regime_filter = True  # per ora fisso ON; dopo lo legheremo a config/CLI
+
+    allow_trade_mask = None
+    allow_long_mask = None
+    allow_short_mask = None
+
+    if use_regime_filter:
+        if "REGIME_L1" not in df.columns:
+            raise ValueError(
+                "REGIME_L1 assente nel CSV KPI. "
+                "Rigenera il file con PyKPI_calcolo + plugin regime."
+            )
+
+        # Policy ALLINEATA agli output del filtro REGIME_L1 (no legacy)
+        # Stati attesi: LATERAL, RANGE, TREND_UP, TREND_DOWN, VOLATILE
+        # Permission puro: il regime NON impone direzione.
+        # Blocca solo nuove entry in VOLATILE.
+        policy = {
+            "VOLATILE": {"allow_long": False, "allow_short": False},  # evitare
+            "LATERAL": {"allow_long": True, "allow_short": True},
+            "RANGE": {"allow_long": True, "allow_short": True},
+            "TREND_UP": {"allow_long": True, "allow_short": True},
+            "TREND_DOWN": {"allow_long": True, "allow_short": True},
+        }
+
+        reg = df["REGIME_L1"].astype(str).fillna("").str.strip().str.upper()
+
+
+        def _p(r: str):
+            # fallback prudente: regime sconosciuto => OFF
+            return policy.get(r, {"allow_long": False, "allow_short": False})
+
+
+        # Permission layer = blocco SOLO delle entry.
+        # Evitiamo che allow_trade_mask influenzi exit/close se generate_signals lo interpreta in modo "forte".
+        allow_trade_mask = None
+        allow_long_mask  = reg.map(lambda r: bool(_p(r)["allow_long"]))
+        allow_short_mask = reg.map(lambda r: bool(_p(r)["allow_short"]))
+    # -------------------------------------------------------------------
+
     out = generate_signals(
         df,
         strategy.conditions,
         reverse_immediate=True,
         exit_priority=True,
+        allow_trade_mask=allow_trade_mask,
+        allow_long_mask=allow_long_mask,
+        allow_short_mask=allow_short_mask,
     )
 
     if "position" not in out.columns:
@@ -865,7 +968,50 @@ def _auto_pick_strategy(df_kpi: pd.DataFrame) -> Optional[Path]:
 
 
 def interactive_selection() -> Selection:
+    # --- directory input KPI (default: _data/Test Data) con conferma/modifica ---
     data_dir = ENV_DATA_DIR if ENV_DATA_DIR else TEST_DATA_DIR
+    data_dir = Path(data_dir).expanduser().resolve()
+
+    while True:
+        print("\n======================================")
+        print("Directory di input (file KPI)")
+        print("======================================")
+        print(f"Default: {data_dir}")
+        ans = input("Confermi? [Y/n] (invio=Y, '?'=aiuto): ").strip()
+
+        if ans == "" or ans.lower() == "y":
+            break
+
+        if ans == "?":
+            print("\nAiuto:")
+            print("- Invio / Y : usa la directory default")
+            print("- n         : inserisci un path alternativo")
+            print("- Puoi incollare direttamente un path completo")
+            continue
+
+        if ans.lower() == "n":
+            newp = input("Inserisci path directory (o invio per annullare): ").strip()
+            if not newp:
+                continue
+            cand = Path(newp).expanduser().resolve()
+            if cand.exists() and cand.is_dir():
+                data_dir = cand
+                continue
+            print(f"❌ Directory non valida: {cand}")
+            continue
+
+        # caso: l'utente incolla direttamente un path
+        cand = Path(ans).expanduser().resolve()
+        if cand.exists() and cand.is_dir():
+            data_dir = cand
+            continue
+
+        print("❌ Scelta non valida. Riprova.")
+
+    # --- normalizzazione: se passano _data, usa _data/Test Data se esiste ---
+    td = (data_dir / "Test Data")
+    if data_dir.name.lower() == "_data" and td.exists() and td.is_dir():
+        data_dir = td.resolve()
 
     kpi = _auto_pick_kpi()
     if kpi is None:
@@ -906,6 +1052,7 @@ def interactive_selection() -> Selection:
 
 
 
+
 def main() -> None:
     print("[DBG] RUNNING FILE:", __file__)
 
@@ -925,6 +1072,8 @@ def main() -> None:
         print(f"[DBG] QC-ONLY Selected KPI      = {kpi_path}")
 
         df = load_kpi_csv(kpi_path)
+        # --- Column safety: preserve KPI_ column order ---
+        original_cols = list(df.columns)
 
         ok = run_strategy_preflight_or_reject(strategy_path, df)
         # In QC-only: exit code 0 se ok, 2 se error (pipeline già protegge e torna al menu)
@@ -943,7 +1092,8 @@ def main() -> None:
     print(f"[DBG] Strategy mtime={st.st_mtime} size={st.st_size} bytes")
 
     df = load_kpi_csv(kpi_path)
-
+    # --- Column safety: preserve original KPI_/REGIME_ column order ---
+    original_cols = list(df.columns)
 
     # SOLO SE QC OK → carica strategia
     strategy = load_strategy(str(strategy_path))
@@ -980,6 +1130,33 @@ def main() -> None:
 
     out_dir = ENV_OUT_DIR if ENV_OUT_DIR else sel.kpi.parent
     out = build_output_path_in_dir(sel.kpi, out_dir)
+
+    # ------------------------------------------------------------
+    # Metadata strategia (colonne costanti nel SIGNAL)
+    # ------------------------------------------------------------
+
+    config_strategy_file = Path(strategy_path).name
+    strategy_name = Path(strategy_path).stem
+
+    df["strategy_name"] = strategy_name
+    df["config_strategy_file"] = config_strategy_file
+
+    # --- Final column order: preserve KPI_/REGIME_ and append new columns only ---
+    new_cols = [c for c in df.columns if c not in original_cols]
+
+    # Vuoi: supertrend_dir + supertrend_dir_txt SUBITO PRIMA delle colonne REGIME_*
+    st_cols = [c for c in ["supertrend_dir", "supertrend_dir_txt"] if c in new_cols]
+    new_cols_rest = [c for c in new_cols if c not in st_cols]
+
+    regime_cols = [c for c in original_cols if c.startswith("REGIME_")]
+
+    if regime_cols and st_cols:
+        first_regime_idx = original_cols.index(regime_cols[0])
+        prefix = original_cols[:first_regime_idx]
+        suffix = original_cols[first_regime_idx:]  # include tutte le REGIME_* (e ciò che segue nel KPI)
+        df = df[prefix + st_cols + suffix + new_cols_rest]
+    else:
+        df = df[original_cols + new_cols]
 
     write_output_csv(df, out)
 

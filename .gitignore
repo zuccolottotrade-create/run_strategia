@@ -36,4 +36,4 @@ SIGNAL_*.csv
 *_PIPELINE_*.py
 *_maxdd_*.py
 *_dd_*.py
-
+config_strategy_FDAX15M_RegimeSwitch.csv

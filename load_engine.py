@@ -584,7 +584,11 @@ def generate_signals(
     conditions: List[Condition],
     reverse_immediate: bool = True,
     exit_priority: bool = True,
+    allow_trade_mask=None,
+    allow_long_mask=None,
+    allow_short_mask=None,
 ) -> pd.DataFrame:
+
     """
     Generates a signal/position series.
     Columns:
@@ -622,6 +626,24 @@ def generate_signals(
 
         el = eval_scope_side(out, i, conditions, scope="ENTRY", side="LONG") if reg else False
         es = eval_scope_side(out, i, conditions, scope="ENTRY", side="SHORT") if reg else False
+
+        # --- REGIME_L1 gating (ENTRY only) -------------------------------
+        # Nota: blocchiamo SOLO gli ENTRY, mai le EXIT.
+        if allow_trade_mask is not None:
+            if not bool(allow_trade_mask.iloc[i]):
+                el = False
+                es = False
+
+        if allow_long_mask is not None:
+            if not bool(allow_long_mask.iloc[i]):
+                el = False
+
+        if allow_short_mask is not None:
+            if not bool(allow_short_mask.iloc[i]):
+                es = False
+        # ----------------------------------------------------------------
+
+
         entry_long.append(el)
         entry_short.append(es)
 
