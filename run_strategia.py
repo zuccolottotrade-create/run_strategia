@@ -270,10 +270,13 @@ def add_trade_enrichment(
 
     trade_counter = 0
 
+    prev_h = ""
+
     # Iterate rows in order
     for i in out.index:
         h = str(hold.loc[i]).upper() if not pd.isna(hold.loc[i]) else ""
         v = value.loc[i]
+
         v_num = None
         if not pd.isna(v):
             try:
@@ -287,16 +290,60 @@ def add_trade_enrichment(
             if pd.isna(t):
                 t = None
 
-        # ENTRY event
-        if h == "IN" and v_num is not None:
+        # ============================================================
+        # ENTRY event (solo transizione OUT -> IN)
+        # ============================================================
+        if h == "IN" and v_num is not None and prev_h != "IN":
             entry_value = v_num
             entry_time = t
 
             # OUT -> next IN (idle)
             if last_exit_time is not None and t is not None:
-                dur_out_next_in.loc[i] = (t - last_exit_time).total_seconds() / 60.0
+                dur_out_next_in.loc[i] = (
+                    t - last_exit_time
+                ).total_seconds() / 60.0
 
+        # ============================================================
         # EXIT event
+        # ============================================================
+        if h == "OUT" and v_num is not None and entry_value is not None:
+            p = v_num - entry_value
+            equity += p
+
+            trade_counter += 1
+            trade_id.loc[i] = trade_counter
+            profit.loc[i] = p
+
+            n_trades += 1
+            if p > 0:
+                n_wins += 1
+
+            # IN -> OUT duration
+            if entry_time is not None and t is not None:
+                dur_in_out.loc[i] = (
+                    t - entry_time
+                ).total_seconds() / 60.0
+
+            # DD from start
+            dd_s = max(0.0, equity_start - equity)
+            mdd_start = max(mdd_start, dd_s)
+
+            # DD from peak
+            peak_equity = max(peak_equity, equity)
+            dd_p = peak_equity - equity
+            mdd_peak = max(mdd_peak, dd_p)
+
+            last_exit_time = t
+
+            # reset
+            entry_value = None
+            entry_time = None
+
+        # ============================================================
+        # aggiornamento stato precedente (SEMPRE, fine giro)
+        # ============================================================
+        prev_h = h
+
         if h == "OUT" and v_num is not None and entry_value is not None:
             p = v_num - entry_value
             equity += p
@@ -324,9 +371,12 @@ def add_trade_enrichment(
 
             last_exit_time = t
 
+
             # reset
             entry_value = None
             entry_time = None
+
+
 
         # Running metrics every row (so the report can read last row)
         sum_profit.loc[i] = equity
@@ -543,6 +593,17 @@ def load_kpi_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep=CSV_SEP, dtype=str)
     df.columns = [c.strip() for c in df.columns]
 
+    # ------------------------------------------------------------
+    # AUTO-FIX separatore: alcuni KPI_* sono TSV (\t) e non ';'
+    # Se abbiamo 1 sola colonna e contiene i TAB nel nome, rileggiamo come TSV.
+    # ------------------------------------------------------------
+    if "date" not in df.columns and len(df.columns) == 1 and "\t" in df.columns[0]:
+        df = pd.read_csv(path, sep="\t", dtype=str)
+        df.columns = [c.strip() for c in df.columns]
+
+    print("[DBG] ncols=", len(df.columns), "cols_head=", df.columns[:10].tolist())
+
+
     for col in ("date", "time", "close"):
         if col not in df.columns:
             graceful_exit(f"Colonna mancante: {col}", 2)
@@ -709,14 +770,19 @@ def debug_conditions_true_rate(df: pd.DataFrame, conditions: List[Any], max_rows
         except Exception as e:
             print(f"  {i}. ERROR eval lhs={lhs!r} op={op!r} rhs={rhs_col or rhs_val!r}: {e!r}")
 
-
-def compute_signal(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> pd.Series:
+def compute_signal(
+    df: pd.DataFrame,
+    strategy: Strategy,
+    debug: bool = False,
+    *,
+    use_regime_filter: bool = True,
+) -> pd.Series:
     print("[DBG] compute_signal ENTER debug=", debug, "rows=", len(df))  # TEMP (sempre)
 
     # --- generate signals ---
 
     # --- REGIME_L1 gating ----------------------------------------------
-    use_regime_filter = True  # per ora fisso ON; dopo lo legheremo a config/CLI
+    # NB: la policy esiste già; qui abilitiamo/disabilitiamo il gating per costruire anche la baseline NO_REGIME.
 
     allow_trade_mask = None
     allow_long_mask = None
@@ -734,26 +800,34 @@ def compute_signal(df: pd.DataFrame, strategy: Strategy, debug: bool = False) ->
         # Permission puro: il regime NON impone direzione.
         # Blocca solo nuove entry in VOLATILE.
         policy = {
-            "VOLATILE": {"allow_long": False, "allow_short": False},  # evitare
+            "VOLATILE": {"allow_long": False, "allow_short": False},  # evitare entry
             "LATERAL": {"allow_long": True, "allow_short": True},
             "RANGE": {"allow_long": True, "allow_short": True},
             "TREND_UP": {"allow_long": True, "allow_short": True},
             "TREND_DOWN": {"allow_long": True, "allow_short": True},
         }
 
-        reg = df["REGIME_L1"].astype(str).fillna("").str.strip().str.upper()
+        reg = (
+            df["REGIME_L1"]
+            .astype(str)
+            .fillna("")
+            .str.strip()
+            .str.upper()
+        )
 
-
-        def _p(r: str):
-            # fallback prudente: regime sconosciuto => OFF
+        def _p(r: str) -> dict:
+            # fallback prudente: regime sconosciuto => OFF (no entry)
             return policy.get(r, {"allow_long": False, "allow_short": False})
 
-
         # Permission layer = blocco SOLO delle entry.
-        # Evitiamo che allow_trade_mask influenzi exit/close se generate_signals lo interpreta in modo "forte".
+        # Evitiamo allow_trade_mask per non influenzare eventuali exit/close
+        # se generate_signals lo interpretasse in modo "forte".
         allow_trade_mask = None
-        allow_long_mask  = reg.map(lambda r: bool(_p(r)["allow_long"]))
+        allow_long_mask = reg.map(lambda r: bool(_p(r)["allow_long"]))
         allow_short_mask = reg.map(lambda r: bool(_p(r)["allow_short"]))
+
+        # Robustezza: se la colonna è tutta vuota/sconosciuta, le maschere diventano False.
+        # (comportamento voluto: meglio zero trade che trade senza regime quando ON)
     # -------------------------------------------------------------------
 
     out = generate_signals(
@@ -789,6 +863,76 @@ def compute_signal(df: pd.DataFrame, strategy: Strategy, debug: bool = False) ->
     sig.index = df.index
     return sig
 
+def _gate_entries_by_regime(
+    df_g: pd.DataFrame,
+    sig: pd.Series,
+    *,
+    regime_col: str = "REGIME_L1",
+) -> pd.Series:
+    """
+    Applica gating REGIME_L1 SOLO sulle nuove ENTRY (OUT->IN).
+    - In VOLATILE: blocca entry LONG/SHORT (qui SHORT è spesso "exit", quindi blocchiamo SOLO se OUT).
+    - Le EXIT (IN->OUT) devono SEMPRE passare.
+    """
+    if regime_col not in df_g.columns:
+        return sig  # nessun regime => non tocchiamo
+
+    reg = (
+        df_g[regime_col]
+        .astype(str)
+        .fillna("")
+        .str.strip()
+        .str.upper()
+        .reindex(sig.index)
+        .fillna("")
+    )
+
+    # Policy: VOLATILE = no nuove entry
+    def allow_entry(r: str, side: str) -> bool:
+        if r == "VOLATILE":
+            return False
+        # default: consenti
+        return True
+
+    out = sig.copy()
+    hold = HOLD_OUT  # stato locale per applicare "entry-only"
+
+    for i in out.index:
+        s = str(out.at[i]).strip().upper()
+        r = str(reg.at[i]).strip().upper()
+
+        # Se già IN, i segnali LONG ripetuti non sono nuove entry -> ok lasciarli
+        if s == "LONG":
+            if hold != HOLD_IN:
+                # nuova ENTRY: consenti solo se regime permette
+                if allow_entry(r, "LONG"):
+                    hold = HOLD_IN
+                else:
+                    out.at[i] = "NEUTRAL"
+            else:
+                # già IN, lasciamo LONG (o potresti neutralizzare)
+                pass
+
+        elif s == "SHORT":
+            if hold == HOLD_IN:
+                # EXIT: deve SEMPRE passare
+                hold = HOLD_OUT
+            else:
+                # SHORT mentre OUT = segnale spurio / entry short (dipende dalla strategia)
+                # qui lo trattiamo come "entry" e lo blocchiamo se regime non permette
+                if allow_entry(r, "SHORT"):
+                    # se la tua semantica usa SHORT come entry short, qui potresti mettere hold=IN
+                    # ma nel tuo engine SHORT è usato come EXIT. Quindi, quando OUT, lo neutralizziamo.
+                    out.at[i] = "NEUTRAL"
+                else:
+                    out.at[i] = "NEUTRAL"
+
+        else:
+            # NEUTRAL
+            pass
+
+    return out
+
 
 def apply_signals(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> pd.DataFrame:
     out = df.copy()
@@ -796,6 +940,7 @@ def apply_signals(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> 
     print("[DBG] apply_signals debug=", debug, "rows=", len(out))  # TEMP
 
     sig_all = pd.Series("NEUTRAL", index=out.index, dtype="object")
+    sig_all_no = pd.Series("NEUTRAL", index=out.index, dtype="object")
 
     groups = list(iter_groups(out))
     print("[DBG] iter_groups count =", len(groups))  # TEMP
@@ -803,49 +948,89 @@ def apply_signals(df: pd.DataFrame, strategy: Strategy, debug: bool = False) -> 
         print("[DBG] group sample:", k, "rows=", len(g))  # TEMP
 
     for key, g in groups:
-        s = compute_signal(g.copy(), strategy, debug=debug)
+        s = compute_signal(g.copy(), strategy, debug=debug, use_regime_filter=True)
+        s_no = compute_signal(g.copy(), strategy, debug=debug, use_regime_filter=False)
 
         s = _norm_str_series(s).fillna("NEUTRAL")
         s = s.reindex(g.index).fillna("NEUTRAL")
 
+        # --- REGIME gating "entry-only" (post-engine): blocca nuove entry in VOLATILE ---
+        reg_col = "REGIME_L1_RAW" if "REGIME_L1_RAW" in g.columns else "REGIME_L1"
+        s = _gate_entries_by_regime(g, s, regime_col=reg_col)
+
+        s_no = _norm_str_series(s_no).fillna("NEUTRAL")
+        s_no = s_no.reindex(g.index).fillna("NEUTRAL")
+
         sig_all.loc[g.index] = s
+        sig_all_no.loc[g.index] = s_no
 
         if debug:
             print(f"[DBG] group={key} signal vc:", s.value_counts(dropna=False).head(5).to_dict())
 
     out["SIGNAL"] = sig_all
+    out["SIGNAL_no_regime"] = sig_all_no
     return out
 
 
 # ============================================================
 # HOLD + VALUE
 # ============================================================
-def apply_hold_value(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
+def apply_hold_value(
+    df: pd.DataFrame,
+    *,
+    signal_col: str = "SIGNAL",
+    hold_col: str = "HOLD",
+    value_col: str = "VALUE",
+) -> Tuple[pd.DataFrame, int, int]:
+    # ============================================================
+    # INIT
+    # ============================================================
     out = df.copy()
-    out["HOLD"] = HOLD_OUT
-    out["VALUE"] = math.nan
+    out[hold_col] = HOLD_OUT
+    out[value_col] = math.nan
 
     entry, exit_ = 0, 0
+
+    # ============================================================
+    # NO_REGIME: FIX VALUE_no_regime sulle entry (OUT->IN)
+    # Motivo: in alcuni flussi VALUE_no_regime resta NaN anche se HOLD_no_regime è corretto.
+    # ============================================================
+    if (
+            "HOLD_no_regime" in out.columns
+            and "VALUE_no_regime" in out.columns
+            and "close" in out.columns
+    ):
+        hold_nr = out["HOLD_no_regime"].astype(str).str.strip().str.upper()
+        m_entry_nr = hold_nr.eq("IN") & ~hold_nr.shift(1).fillna("OUT").eq("IN")
+
+        # Se VALUE_no_regime è NaN sulle entry, la valorizziamo con close della barra di entry
+        m_fix = m_entry_nr & out["VALUE_no_regime"].isna()
+        if m_fix.any():
+            out.loc[m_fix, "VALUE_no_regime"] = out.loc[m_fix, "close"]
 
     for _, g in iter_groups(out):
         hold = HOLD_OUT
         for i in g.index:
-            sig = str(out.at[i, "SIGNAL"]).strip().upper()
+            sig = str(out.at[i, signal_col]).strip().upper()
             close = out.at[i, "close"]
 
+            # ENTRY: OUT -> IN
             if sig == "LONG" and hold != HOLD_IN:
                 hold = HOLD_IN
-                out.at[i, "VALUE"] = close
+                out.at[i, value_col] = close
                 entry += 1
 
+            # EXIT: IN -> OUT  (FIX)
             elif sig == "SHORT" and hold != HOLD_OUT:
                 hold = HOLD_OUT
-                out.at[i, "VALUE"] = close
+                out.at[i, value_col] = close
                 exit_ += 1
 
-            out.at[i, "HOLD"] = hold
+            # HOLD state (sempre coerente)
+            out.at[i, hold_col] = hold
 
     return out, entry, exit_
+
 
 
 # ============================================================
@@ -1114,6 +1299,15 @@ def main() -> None:
 
     df = apply_signals(df, strategy, debug=debug_engine)
 
+    print("[DBG] gated vs no_regime signal equality ratio:",
+          float((df["SIGNAL"] == df["SIGNAL_no_regime"]).mean()))
+    print("[DBG] gated SIGNAL vc:", df["SIGNAL"].value_counts().head(10).to_dict())
+    print("[DBG] no_regime SIGNAL vc:", df["SIGNAL_no_regime"].value_counts().head(10).to_dict())
+
+    # --- NO_REGIME context marker (sempre abilitato) ---
+    # Serve solo come colonna di confronto/report; non influenza la strategia.
+    df["REGIME_no_regime"] = "ALL"  # oppure "ALWAYS_ON"
+
     print("[DBG] SIGNAL dtype:", df["SIGNAL"].dtype if "SIGNAL" in df.columns else None)
     print("[DBG] SIGNAL notna ratio:", float(df["SIGNAL"].notna().mean()) if "SIGNAL" in df.columns else None)
     print("[DBG] SIGNAL head:", df["SIGNAL"].head(10).tolist() if "SIGNAL" in df.columns else None)
@@ -1122,11 +1316,134 @@ def main() -> None:
         df["SIGNAL"].value_counts(dropna=False).head(10).to_dict() if "SIGNAL" in df.columns else None,
     )
 
+    # ============================================================
+    # REGIME gating - BLOCCA ENTRY e FORZA EXIT in VOLATILE (RAW)
+    # ============================================================
+    if "REGIME_L1_RAW" in df.columns and "SIGNAL" in df.columns:
+        reg = df["REGIME_L1_RAW"].astype(str).str.upper().str.strip()
+        sig = df["SIGNAL"].astype(str).str.upper().str.strip()
+
+        out_sig = sig.copy()
+        hold_state = HOLD_OUT
+        forced_exits = 0
+        blocked_entries = 0
+
+        for j in out_sig.index:
+            r = reg.at[j]
+            s = out_sig.at[j]
+
+            # --- FORZA USCITA se siamo IN e il regime diventa VOLATILE ---
+            if r == "VOLATILE" and hold_state == HOLD_IN:
+                # forza exit sulla prima barra VOLATILE mentre siamo IN
+                out_sig.at[j] = "SHORT"
+                hold_state = HOLD_OUT
+                forced_exits += 1
+                continue
+
+            if s == "LONG":
+                if hold_state != HOLD_IN:
+                    # nuova entry: in VOLATILE la blocchiamo
+                    if r == "VOLATILE":
+                        out_sig.at[j] = "NEUTRAL"
+                        blocked_entries += 1
+                    else:
+                        hold_state = HOLD_IN
+                # se già IN, lasciamo LONG
+
+            elif s == "SHORT":
+                # EXIT sempre permessa se siamo IN
+                if hold_state == HOLD_IN:
+                    hold_state = HOLD_OUT
+                else:
+                    # SHORT mentre OUT non deve aprire nuove posizioni
+                    out_sig.at[j] = "NEUTRAL"
+
+            else:
+                # NEUTRAL o altro
+                pass
+
+        df["SIGNAL"] = out_sig
+
+    # DBG: verifica gating applicato
+    if "REGIME_L1_RAW" in df.columns and "SIGNAL" in df.columns:
+        _mask = df["REGIME_L1_RAW"].astype(str).str.upper().str.strip().eq("VOLATILE")
+        _sigL = df["SIGNAL"].astype(str).str.upper().str.strip().eq("LONG")
+        _hold = df["SIGNAL"].astype(str).str.upper().str.strip().eq("LONG")  # proxy
+        print(
+            "[DBG][POST-GATE] VOLATILE rows =", int(_mask.sum()),
+            "SIGNAL LONG in VOLATILE =", int((_mask & _sigL).sum()),
+        )
+
     df, entry, exit_ = apply_hold_value(df)
+    df, entry_nr, exit_nr = apply_hold_value(
+        df,
+        signal_col="SIGNAL_no_regime",
+        hold_col="HOLD_no_regime",
+        value_col="VALUE_no_regime",
+    )
 
     df = normalize_signal_hold(df)
 
     df, trade_summary = add_trade_enrichment(df, trading_day_minutes=480.0, trading_days_per_week=5.0)
+
+    # ------------------------------------------------------------
+    # NO_REGIME trade enrichment (Profit/Trade, Trade_ID, timing, freq)
+    # calcolato usando HOLD_no_regime / VALUE_no_regime
+    # ------------------------------------------------------------
+    required_nr = ["HOLD_no_regime", "VALUE_no_regime"]
+    if all(c in df.columns for c in required_nr):
+        df_tmp = df.copy()
+
+        # Rimappo le colonne attese da add_trade_enrichment
+        df_tmp["HOLD"] = df_tmp["HOLD_no_regime"]
+        df_tmp["VALUE"] = df_tmp["VALUE_no_regime"]
+
+        # se VALUE_no_regime è NaN sulle entry, usiamo close (robusto)
+        hold_nr = df_tmp["HOLD_no_regime"].astype(str).str.strip().str.upper()
+        m_entry_nr = hold_nr.eq("IN") & ~hold_nr.shift(1).fillna("OUT").eq("IN")
+
+        # fill SOLO sulla barra di entry
+        df_tmp.loc[m_entry_nr & df_tmp["VALUE_no_regime"].isna(), "VALUE_no_regime"] = df_tmp.loc[
+            m_entry_nr & df_tmp["VALUE_no_regime"].isna(), "close"
+        ]
+
+        # riallineo VALUE atteso (entry-only)
+        df_tmp.loc[m_entry_nr & df_tmp["VALUE"].isna(), "VALUE"] = df_tmp.loc[
+            m_entry_nr & df_tmp["VALUE"].isna(), "close"
+        ]
+
+        # RICALCOLO enrichment su df_tmp usando HOLD/VALUE rimappati (NO_REGIME)
+        df_tmp, _ = add_trade_enrichment(
+            df_tmp,
+            trading_day_minutes=480.0,
+            trading_days_per_week=5.0
+        )
+
+
+
+
+        # colonne prodotte da add_trade_enrichment che vuoi anche in versione _no_regime
+        enrich_cols = [
+            "Profit/Trade",
+            "Trade_ID",
+            "Minutes_IN_to_OUT",
+            "Minutes_OUT_to_next_IN",
+            "Sum Profit/Trade",
+            "Avg Profit/Trade",
+            "Win Rate",
+            "Max DD Start",
+            "Max DD Peak",
+            "Trades/Day_8h_AvgIdle",
+            "Trades/Day_8h_MedIdle",
+            "Trades/Week_8h_AvgIdle",
+            "Trades/Week_8h_MedIdle",
+        ]
+
+        for c in enrich_cols:
+            if c in df_tmp.columns:
+                df[f"{c}_no_regime"] = df_tmp[c]
+    else:
+        print("[WARN] NO_REGIME enrichment skipped: missing columns", required_nr)
 
     out_dir = ENV_OUT_DIR if ENV_OUT_DIR else sel.kpi.parent
     out = build_output_path_in_dir(sel.kpi, out_dir)
@@ -1144,9 +1461,51 @@ def main() -> None:
     # --- Final column order: preserve KPI_/REGIME_ and append new columns only ---
     new_cols = [c for c in df.columns if c not in original_cols]
 
-    # Vuoi: supertrend_dir + supertrend_dir_txt SUBITO PRIMA delle colonne REGIME_*
-    st_cols = [c for c in ["supertrend_dir", "supertrend_dir_txt"] if c in new_cols]
-    new_cols_rest = [c for c in new_cols if c not in st_cols]
+    # 1) separa il blocco ungated: tutte le colonne *_no_regime devono stare in fondo, contigue
+    # Ordine ungated = stesso ordine delle gated, con suffisso _no_regime
+    order_template = [
+        # --- context marker ---
+        "REGIME",
+
+        # --- signal layer ---
+        "SIGNAL",
+        "HOLD",
+        "VALUE",
+
+        # --- trade enrichment (report-like columns) ---
+        "Profit/Trade",
+        "Trade_ID",
+        "Minutes_IN_to_OUT",
+        "Minutes_OUT_to_next_IN",
+        "Sum Profit/Trade",
+        "Avg Profit/Trade",
+        "Win Rate",
+        "Max DD Start",
+        "Max DD Peak",
+        "Trades/Day_8h_AvgIdle",
+        "Trades/Day_8h_MedIdle",
+        "Trades/Week_8h_AvgIdle",
+        "Trades/Week_8h_MedIdle",
+
+
+    ]
+
+    # Lista desiderata in output (solo se esiste)
+    no_regime_cols = []
+    for base in order_template:
+        c = f"{base}_no_regime"
+        if c in df.columns:
+            no_regime_cols.append(c)
+
+    # Aggiungi eventuali altre *_no_regime non previste in template, ma senza rompere la contiguità
+    extra_nr = [c for c in new_cols if c.endswith("_no_regime") and c not in no_regime_cols]
+    no_regime_cols += extra_nr
+
+    new_cols_base = [c for c in new_cols if c not in no_regime_cols]
+
+    # 2) Vuoi: supertrend_dir + supertrend_dir_txt SUBITO PRIMA delle colonne REGIME_*
+    st_cols = [c for c in ["supertrend_dir", "supertrend_dir_txt"] if c in new_cols_base]
+    new_cols_rest = [c for c in new_cols_base if c not in st_cols]
 
     regime_cols = [c for c in original_cols if c.startswith("REGIME_")]
 
@@ -1154,9 +1513,19 @@ def main() -> None:
         first_regime_idx = original_cols.index(regime_cols[0])
         prefix = original_cols[:first_regime_idx]
         suffix = original_cols[first_regime_idx:]  # include tutte le REGIME_* (e ciò che segue nel KPI)
-        df = df[prefix + st_cols + suffix + new_cols_rest]
+        df = df[prefix + st_cols + suffix + new_cols_rest + no_regime_cols]
     else:
-        df = df[original_cols + new_cols]
+        df = df[original_cols + new_cols_rest + no_regime_cols]
+
+    # DBG: verifica finale prima del salvataggio
+    if "REGIME_L1_RAW" in df.columns and "SIGNAL" in df.columns and "HOLD" in df.columns:
+        _mask = df["REGIME_L1_RAW"].astype(str).str.upper().str.strip().eq("VOLATILE")
+        _hold_in = df["HOLD"].astype(str).str.upper().str.strip().eq("IN")
+        _sigL = df["SIGNAL"].astype(str).str.upper().str.strip().eq("LONG")
+        print("[DBG][PRE-SAVE] VOLATILE rows =", int(_mask.sum()),
+              "HOLD IN in VOLATILE =", int((_mask & _hold_in).sum()),
+              "SIGNAL LONG in VOLATILE =", int((_mask & _sigL).sum()))
+
 
     write_output_csv(df, out)
 
