@@ -11,6 +11,15 @@ Key goals:
 - Keep engine integration (load_engine.load_config_strategy / generate_signals)
 - IMPORTANT: QC/preflight single source of truth (same behavior as stand-alone preflight)
 """
+def _to_float_comma(s: pd.Series) -> pd.Series:
+    """
+    Converte serie numeriche lette come stringhe in formato EU (virgola decimale)
+    in float. Esempio: "428,000" -> 428.0
+    """
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
 
 # ============================================================
 # BOOTSTRAP – must stay BEFORE importing suite modules
@@ -600,6 +609,24 @@ def load_kpi_csv(path: Path) -> pd.DataFrame:
     if "date" not in df.columns and len(df.columns) == 1 and "\t" in df.columns[0]:
         df = pd.read_csv(path, sep="\t", dtype=str)
         df.columns = [c.strip() for c in df.columns]
+    # ------------------------------------------------------------
+    # NORMALIZE metadata columns (case-insensitive)
+    # Goal: ensure SIGNAL output keeps 'symbol' and 'isin' even if
+    # upstream CSV uses 'Symbol', 'ISIN', etc.
+    # ------------------------------------------------------------
+    colmap = {c.lower(): c for c in df.columns}
+
+    # Normalize to canonical lowercase names when present
+    for key in ("symbol", "isin", "exchange", "currency"):
+        if key in colmap and key not in df.columns:
+            df = df.rename(columns={colmap[key]: key})
+
+    # If both variants exist (rare), prefer canonical and drop duplicate
+    for key in ("symbol", "isin"):
+        dup = [c for c in df.columns if c.lower() == key and c != key]
+        if key in df.columns and dup:
+            # keep canonical 'key', drop other case-variants
+            df = df.drop(columns=dup)
 
     print("[DBG] ncols=", len(df.columns), "cols_head=", df.columns[:10].tolist())
 
@@ -632,6 +659,9 @@ def load_kpi_csv(path: Path) -> pd.DataFrame:
 
     numeric_candidates = [c for c in df.columns if c not in non_numeric]
     coerce_numeric_eu_inplace(df, numeric_candidates)
+
+    print("[DBG][DTYPE] close dtype:", df["close"].dtype, "EMA21 dtype:", df.get("KPI_EMA_21").dtype)
+    print("[DBG][SAMPLE] close/EMA21:", df["close"].head(3).tolist(), df["KPI_EMA_21"].head(3).tolist())
 
     # --- QC: REGIME textual columns must not be wiped by coercion ---
     qc_cols = list(regime_text_cols)
@@ -807,27 +837,48 @@ def compute_signal(
             "TREND_DOWN": {"allow_long": True, "allow_short": True},
         }
 
+        # --- Normalizza REGIME_L1 per compatibilità:
+        # Alcuni dataset usano REGIME_L1 come LABEL (es. "TREND_UP"),
+        # altri come CODE numerico (es. 0/1/2...) + colonna REGIME_L1_RAW con la label.
+        # Qui vogliamo SEMPRE una label maiuscola per applicare la policy senza bloccare tutta l'operatività.
+        reg_src = None
+
+        if "REGIME_L1_RAW" in df.columns:
+            reg_src = df["REGIME_L1_RAW"]
+        else:
+            reg_src = df["REGIME_L1"]
+
         reg = (
-            df["REGIME_L1"]
-            .astype(str)
+            reg_src.astype(str)
             .fillna("")
             .str.strip()
             .str.upper()
         )
 
-        def _p(r: str) -> dict:
-            # fallback prudente: regime sconosciuto => OFF (no entry)
-            return policy.get(r, {"allow_long": False, "allow_short": False})
+        # Se REGIME_L1 è un codice numerico e REGIME_L1_RAW non esiste, la policy
+        # non deve trasformarsi in "tutto OFF". In quel caso abilitiamo tutte le entry
+        # e avvisiamo (comportamento più sicuro per non bloccare la pipeline).
+        looks_numeric = reg.str.fullmatch(r"-?\d+(?:[\.,]\d+)?").fillna(False)
+        if bool(looks_numeric.mean() > 0.95) and "REGIME_L1_RAW" not in df.columns:
+            print("[WARN][REGIME] REGIME_L1 sembra numerico e REGIME_L1_RAW assente: gating permissivo (no-block).")
+            allow_trade_mask = None
+            allow_long_mask = pd.Series(True, index=df.index)
+            allow_short_mask = pd.Series(True, index=df.index)
+        else:
 
-        # Permission layer = blocco SOLO delle entry.
-        # Evitiamo allow_trade_mask per non influenzare eventuali exit/close
-        # se generate_signals lo interpretasse in modo "forte".
-        allow_trade_mask = None
-        allow_long_mask = reg.map(lambda r: bool(_p(r)["allow_long"]))
-        allow_short_mask = reg.map(lambda r: bool(_p(r)["allow_short"]))
+            def _p(r: str) -> dict:
+                # fallback prudente: regime sconosciuto => OFF (no entry)
+                return policy.get(r, {"allow_long": False, "allow_short": False})
 
-        # Robustezza: se la colonna è tutta vuota/sconosciuta, le maschere diventano False.
-        # (comportamento voluto: meglio zero trade che trade senza regime quando ON)
+            # Permission layer = blocco SOLO delle entry.
+            # Evitiamo allow_trade_mask per non influenzare eventuali exit/close
+            # se generate_signals lo interpretasse in modo "forte".
+            allow_trade_mask = None
+            allow_long_mask = reg.map(lambda r: bool(_p(r)["allow_long"]))
+            allow_short_mask = reg.map(lambda r: bool(_p(r)["allow_short"]))
+
+            # Robustezza: se la colonna è tutta vuota/sconosciuta, le maschere diventano False.
+            # (comportamento voluto: meglio zero trade che trade senza regime quando ON)
     # -------------------------------------------------------------------
 
     out = generate_signals(
@@ -855,13 +906,24 @@ def compute_signal(
     pos = pd.to_numeric(out["position"], errors="coerce")
     pos_i = pos.fillna(0).astype(int)
 
-    sig = (
-        pos_i.map({1: "LONG", -1: "SHORT", 0: "NEUTRAL"})
-        .fillna("NEUTRAL")
-        .astype("object")
-    )
-    sig.index = df.index
+    # ============================================================
+    # EVENT SIGNALS (NOT STATE)
+    # - LONG  = entry event (0 -> 1)
+    # - SHORT = exit event  (1 -> 0)
+    # - NEUTRAL otherwise
+    # Questo è coerente con apply_hold_value(): SHORT = EXIT.
+    # ============================================================
+    prev = pos_i.shift(1).fillna(0).astype(int)
+
+    m_entry_long = prev.ne(1) & pos_i.eq(1)  # 0->1 (o -1->1)
+    m_exit_long = prev.eq(1) & pos_i.ne(1)  # 1->0 (o 1->-1)
+
+    sig = pd.Series("NEUTRAL", index=df.index, dtype="object")
+    sig.loc[m_entry_long] = "LONG"
+    sig.loc[m_exit_long] = "SHORT"
+
     return sig
+
 
 def _gate_entries_by_regime(
     df_g: pd.DataFrame,
@@ -1061,7 +1123,164 @@ def print_summary(df: pd.DataFrame, entry: int, exit_: int) -> None:
     print(f"Righe: {len(df)}")
     print(f"LONG={vc.get('LONG', 0)} SHORT={vc.get('SHORT', 0)} NEUTRAL={vc.get('NEUTRAL', 0)}")
     print(f"IN={entry} OUT={exit_}")
+    # ============================================================
+    # EXTRA RIEPILOGO PERFORMANCE
+    # ============================================================
 
+    # ============================================================
+    # BUY & HOLD (FILO)
+    # ============================================================
+    if "close" in df.columns:
+        close_series = pd.to_numeric(
+            df["close"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        ).dropna()
+
+        if len(close_series) >= 2:
+            buy_hold_filo = float(close_series.iloc[-1] - close_series.iloc[0])
+            print(f"Buy & Hold (FILO): {round(buy_hold_filo, 4)}")
+        else:
+            print("Buy & Hold (FILO): dati insufficienti")
+
+    # 1) Cumulato finale Sum Profit/Trade
+    if "Sum Profit/Trade" in df.columns:
+        sum_profit_series = pd.to_numeric(
+            df["Sum Profit/Trade"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
+        final_cum_profit = sum_profit_series.dropna().iloc[-1] if sum_profit_series.dropna().any() else 0.0
+        print(f"Sum Profit/Trade (finale cumulato): {round(final_cum_profit, 4)}")
+
+    # 2) Lista Profit/Trade + Regime di apertura + mini riepilogo per regime
+    if "Profit/Trade" in df.columns:
+        # Profit/Trade numerico (robusto per virgole EU)
+        pt_num = pd.to_numeric(
+            df["Profit/Trade"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
+
+        # Closed trades = righe dove Profit/Trade è valorizzato
+        closed = df.loc[pt_num.notna(), ["Trade_ID"]].copy() if "Trade_ID" in df.columns else df.loc[
+            pt_num.notna(), []].copy()
+        closed["Profit/Trade"] = pt_num.loc[pt_num.notna()]
+
+        # Regime all'ENTRY: prendiamo la prima riga di ogni Trade_ID (barra di ingresso)
+        entry_regime_col = None
+        if "REGIME_L1" in df.columns:
+            entry_regime_col = "REGIME_L1"
+        elif "REGIME_L1_CODE" in df.columns:
+            entry_regime_col = "REGIME_L1_CODE"
+
+        if "Trade_ID" in df.columns and entry_regime_col is not None:
+            entry_regime_map = (
+                df.loc[df["Trade_ID"].notna()]
+                .groupby("Trade_ID", sort=True)[entry_regime_col]
+                .first()
+            )
+            closed["Entry_Regime"] = closed["Trade_ID"].map(entry_regime_map)
+        else:
+            closed["Entry_Regime"] = None
+
+        print("Lista Profit/Trade:")
+
+        # --- closed trades dataframe: deve contenere Profit/Trade e (se possibile) Entry_Regime ---
+        # Rinominare Profit/Trade per evitare problemi con slash in alcune API pandas
+        if "Profit/Trade" in closed.columns:
+            closed = closed.rename(columns={"Profit/Trade": "Profit_Trade"})
+
+        # Reset index per iterazione stabile e numbering coerente
+        closed2 = closed.reset_index(drop=True)
+
+        for i, r in enumerate(closed2.iterrows(), 1):
+            row = r[1]  # pandas.Series
+
+            p = row.get("Profit_Trade", None)
+            if p is None or (isinstance(p, float) and pd.isna(p)):
+                continue
+
+            reg = row.get("Entry_Regime", None)
+
+            if reg is None or (isinstance(reg, float) and pd.isna(reg)):
+                print(f"Trade {i}: {round(float(p), 4)}")
+            else:
+                print(f"Trade {i}: {round(float(p), 4)} (Regime={reg})")
+
+        # ============================================================
+        # MINI RIEPILOGO PER REGIME (regime all'ENTRY del trade)
+        # ============================================================
+        if "Entry_Regime" in closed2.columns and closed2["Entry_Regime"].notna().any():
+            print("\n===== REGIME SUMMARY (Entry Regime) =====")
+            grp = closed2.dropna(subset=["Entry_Regime"]).groupby("Entry_Regime", sort=True)
+
+            for reg_key, sub in grp:
+                vals = pd.to_numeric(sub.get("Profit_Trade"), errors="coerce").dropna()
+                n = int(len(vals))
+                if n == 0:
+                    continue
+
+                wins = int((vals > 0).sum())
+                losses = int((vals < 0).sum())
+                zeros = int((vals == 0).sum())
+
+                gross_profit = float(vals[vals > 0].sum())
+                gross_loss = float(vals[vals < 0].sum())  # negativo
+                net = float(vals.sum())
+
+                win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+                avg_win = float(vals[vals > 0].mean()) if wins > 0 else 0.0
+                avg_loss = float(vals[vals < 0].mean()) if losses > 0 else 0.0
+
+                pf = (gross_profit / abs(gross_loss)) if gross_loss != 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+                print(
+                    f"- {reg_key}: N={n} | Wins={wins} Losses={losses} Zeros={zeros} | "
+                    f"WinRate={win_rate:.2f}% | Net={net:.4f} | GP={gross_profit:.4f} GL={gross_loss:.4f} | "
+                    f"PF={pf:.4f} | AvgWin={avg_win:.4f} AvgLoss={avg_loss:.4f}"
+                )
+
+    # ============================================================
+    # WIN / LOSS SUMMARY (da Profit/Trade)
+    # ============================================================
+    if "Profit/Trade" in df.columns:
+        p = pd.to_numeric(
+            df["Profit/Trade"].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        ).dropna()
+
+        if len(p) == 0:
+            print("WIN/LOSS SUMMARY: nessun trade chiuso (Profit/Trade vuoto).")
+        else:
+            wins = p[p > 0]
+            losses = p[p < 0]
+            zeros = p[p == 0]
+
+            n_trades = int(len(p))
+            n_wins = int(len(wins))
+            n_losses = int(len(losses))
+            n_zeros = int(len(zeros))
+
+            gross_profit = float(wins.sum()) if n_wins else 0.0
+            gross_loss = float(losses.sum()) if n_losses else 0.0  # negativo
+            net_profit = float(p.sum())
+
+            avg_win = float(wins.mean()) if n_wins else 0.0
+            avg_loss = float(losses.mean()) if n_losses else 0.0  # negativo
+            win_rate = (n_wins / n_trades) * 100.0 if n_trades else 0.0
+
+            # Profit Factor: GP / abs(GL) (se GL=0 → inf se GP>0)
+            denom = abs(gross_loss)
+            profit_factor = (gross_profit / denom) if denom > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+            print("\n===== WIN / LOSS SUMMARY =====")
+            print(f"Trades closed (da Profit/Trade): {n_trades}")
+            print(f"Wins: {n_wins} | Losses: {n_losses} | Zeros: {n_zeros}")
+            print(f"Win Rate: {round(win_rate, 2)}%")
+            print(f"Gross Profit: {round(gross_profit, 4)}")
+            print(f"Gross Loss: {round(gross_loss, 4)}")
+            print(f"Net Profit: {round(net_profit, 4)}")
+            print(f"Avg Win: {round(avg_win, 4)}")
+            print(f"Avg Loss: {round(avg_loss, 4)}")
+            print(f"Profit Factor: {round(profit_factor, 4) if profit_factor != float('inf') else 'inf'}")
 
 # ============================================================
 # FLOW
@@ -1280,11 +1499,70 @@ def main() -> None:
     # --- Column safety: preserve original KPI_/REGIME_ column order ---
     original_cols = list(df.columns)
 
-    # SOLO SE QC OK → carica strategia
+        # SOLO SE QC OK → carica strategia
     strategy = load_strategy(str(strategy_path))
 
-    # Coerce only required indicators (engine comparisons become deterministic)
-    df = coerce_required_indicators(df, strategy.required_indicators)
+    # ============================================================
+    # QC HARD: CONDITIONS (loaded/enabled) + colonne usate nelle rules
+    # ============================================================
+    conds = list(getattr(strategy, "conditions", []) or [])
+    enabled_conds = [c for c in conds if bool(getattr(c, "enabled", False))]
+
+    print(f"[QC][CONDS] loaded={len(conds)} enabled={len(enabled_conds)}")
+
+    if len(enabled_conds) == 0:
+        print("[ERROR][CONDS] Nessuna condition ENABLED -> engine position sarà sempre 0 -> SIGNAL sempre NEUTRAL.")
+        print("[HINT][CONDS] Controlla foglio CONDITIONS: colonna 'enabled' (True/1) e mapping loader.")
+        raise SystemExit(2)
+
+    # colonne referenziate dalle CONDITIONS abilitate
+    cols_in_rules: set[str] = set()
+    for c in enabled_conds:
+        lhs = str(getattr(c, "lhs_col", "") or "").strip()
+        rhs_type = str(getattr(c, "rhs_type", "") or "").strip().upper()
+        rhs_col = str(getattr(c, "rhs_col", "") or "").strip()
+
+        if lhs:
+            cols_in_rules.add(lhs)
+        if rhs_type == "COLUMN" and rhs_col:
+            cols_in_rules.add(rhs_col)
+
+    missing_rule_cols = sorted([x for x in cols_in_rules if x not in df.columns])
+    if missing_rule_cols:
+        print("[WARN][CONDS] Colonne MANCANTI nel df ma usate nelle CONDITIONS:")
+        for x in missing_rule_cols:
+            print("  -", x)
+
+    # Coerce: required_indicators + tutte le colonne realmente usate dalle rules abilitate
+    all_needed = sorted(set(strategy.required_indicators) | cols_in_rules)
+    df = coerce_required_indicators(df, all_needed)
+
+    # QC NaN ratio (se una colonna è NaN quasi ovunque, le maschere diventano sempre False)
+    nan_ratios = []
+    for c in sorted(cols_in_rules):
+        if c in df.columns:
+            nan_ratios.append((c, float(df[c].isna().mean())))
+    nan_ratios.sort(key=lambda x: x[1], reverse=True)
+
+    print("[QC][CONDS] NaN ratio on rule columns (top 15):")
+    for c, r in nan_ratios[:15]:
+        print(f"  - {c}: {r:.3f}")
+
+    print("Dtypes check:")
+    print(df[["close", "KPI_EMA_21", "KPI_EMA_50", "KPI_EMA_200"]].dtypes)
+
+    print("\n[QC] DTYPE CHECK")
+    cols_check = ["close", "KPI_EMA_21", "KPI_EMA_50", "KPI_EMA_200"]
+    for c in cols_check:
+        if c in df.columns:
+            print(c, "->", df[c].dtype)
+
+    print("\n[QC] EXIT RAW TRUE COUNT")
+    if "KPI_EMA_21" in df.columns and "KPI_EMA_50" in df.columns:
+        print("EMA21 < EMA50 =", (df["KPI_EMA_21"] < df["KPI_EMA_50"]).sum())
+
+    if "close" in df.columns and "KPI_EMA_50" in df.columns:
+        print("close < EMA50 =", (df["close"] < df["KPI_EMA_50"]).sum())
 
     missing = [c for c in strategy.required_indicators if c not in df.columns]
     if missing:
@@ -1507,7 +1785,14 @@ def main() -> None:
     st_cols = [c for c in ["supertrend_dir", "supertrend_dir_txt"] if c in new_cols_base]
     new_cols_rest = [c for c in new_cols_base if c not in st_cols]
 
-    regime_cols = [c for c in original_cols if c.startswith("REGIME_")]
+    # --- REGIME columns: prendi SEMPRE tutte quelle presenti nel df finale ---
+    regime_cols = [c for c in df.columns if c.startswith("REGIME_")]
+
+    # se alcune erano già in original_cols, mantieni la posizione originale
+    regime_cols_original_order = [c for c in original_cols if c in regime_cols]
+    regime_cols_new = [c for c in regime_cols if c not in regime_cols_original_order]
+
+    regime_cols = regime_cols_original_order + regime_cols_new
 
     if regime_cols and st_cols:
         first_regime_idx = original_cols.index(regime_cols[0])
